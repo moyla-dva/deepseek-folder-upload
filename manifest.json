@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek 文件夹上传助手",
+  "version": "1.0",
+  "description": "在 DeepSeek Chat 中选择文件夹，自动过滤合规文件并批量上传",
+  "icons": {
+    "48": "icon.png",
+    "128": "icon.png"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chat.deepseek.com/*",
+        "https://www.deepseek.com/chat*",
+        "https://deepseek.com/chat*"
+      ],
+      "js": ["dfs-core.js", "dfs-ui.js", "dfs-dom-adapter.js", "dfs-workflow.js", "dfs-shell.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "host_permissions": [
+    "https://chat.deepseek.com/*",
+    "https://www.deepseek.com/chat*",
+    "https://deepseek.com/chat*"
+  ]
+}
