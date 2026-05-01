@@ -19,6 +19,8 @@
     getQueuedItemsAfterCurrentBatch,
     getCurrentBatchNumber,
     getProgressPercent,
+    getKnownComposerAttachmentCount,
+    setRenderSnapshot,
     refreshTotalBatches,
     saveState,
     escapeHtml,
@@ -29,6 +31,9 @@
   } = shared;
 
   function getComposerAttachmentCount() {
+    if (typeof getKnownComposerAttachmentCount === 'function') {
+      return getKnownComposerAttachmentCount();
+    }
     return typeof shared.getComposerAttachmentCount === 'function'
       ? shared.getComposerAttachmentCount()
       : 0;
@@ -60,18 +65,110 @@
     if (skippedTab) skippedTab.textContent = state.skipped.length ? `已跳过 ${state.skipped.length}` : '已跳过';
   }
 
+  function getSessionLogStatusMeta(status) {
+    switch (status) {
+      case 'injecting':
+        return { text: '注入中', chip: 'amber' };
+      case 'awaiting_send':
+        return { text: '待发送', chip: 'slate' };
+      case 'sending':
+        return { text: '发送中', chip: 'teal' };
+      case 'sent':
+        return { text: '已发送', chip: 'green' };
+      case 'assumed_sent':
+        return { text: '人工确认', chip: 'sand' };
+      case 'failed':
+        return { text: '失败', chip: 'red' };
+      case 'paused':
+        return { text: '已暂停', chip: 'gray' };
+      default:
+        return { text: '处理中', chip: 'gray' };
+    }
+  }
+
+  function formatLogTime(isoText) {
+    if (!isoText) return '';
+    const date = new Date(isoText);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit'
+    });
+  }
+
+  function getSessionLogTimeline(entry) {
+    const segments = [];
+    const startedAt = formatLogTime(entry.startedAt);
+    const sentAt = formatLogTime(entry.sentAt);
+    const settledAt = formatLogTime(entry.settledAt);
+
+    if (startedAt) segments.push(`开始 ${startedAt}`);
+    if (sentAt) segments.push(`发送 ${sentAt}`);
+    if (settledAt) segments.push(`完成 ${settledAt}`);
+
+    return segments.join(' · ');
+  }
+
+  function renderSessionLogSection() {
+    if (!state.sessionLog.length) return '';
+
+    const logItems = state.sessionLog.slice(0, 6).map(entry => {
+      const meta = getSessionLogStatusMeta(entry.status);
+      const filePreview = (entry.fileNames || []).slice(0, 4);
+      const extraCount = Math.max(0, (entry.fileCount || 0) - filePreview.length);
+      const details = [
+        `第 ${entry.batchNumber || '-'} 批`,
+        `${entry.fileCount || 0} 个文件`
+      ];
+      const timeline = getSessionLogTimeline(entry);
+      if (timeline) details.push(timeline);
+      if (entry.errorType) details.push(`类型 ${escapeHtml(entry.errorType)}`);
+
+      return `
+        <article class="dfs-log-item">
+          <div class="dfs-log-top">
+            <div class="dfs-log-title">${details.join(' · ')}</div>
+            <span class="dfs-chip ${meta.chip}">${meta.text}</span>
+          </div>
+          ${entry.notes ? `<div class="dfs-log-note">${escapeHtml(entry.notes)}</div>` : ''}
+          <div class="dfs-file-grid is-compact">
+            ${filePreview.map(name => renderFileChip({ name })).join('')}
+            ${extraCount ? `<span class="dfs-file-chip dfs-file-chip-more">+${extraCount} 个…</span>` : ''}
+          </div>
+        </article>
+      `;
+    }).join('');
+
+    return `
+      <section class="dfs-panel-card tone-log">
+        <div class="dfs-section-head">
+          <div>
+            <div class="dfs-section-kicker">Session Log</div>
+            <div class="dfs-section-label">本次会话记录</div>
+          </div>
+          <div class="dfs-panel-meta">最近 ${Math.min(state.sessionLog.length, 6)} 批</div>
+        </div>
+        <div class="dfs-log-list">${logItems}</div>
+      </section>
+    `;
+  }
+
   function renderQueueTab() {
     const body = document.getElementById('dfs-drawer-body');
     if (!body) return;
 
     if (!hasPendingWork() && state.phase === 'done') {
-      body.innerHTML = `
+      body.innerHTML = [
+        `
         <section class="dfs-hero-card is-success">
           <div class="dfs-card-kicker">Session Complete</div>
           <h3 class="dfs-empty-title">全部批次已经处理完成</h3>
           <p class="dfs-empty-copy">当前对话的资料已全部送入流程。你可以直接查看结果，或关闭工作台开始新的上传。</p>
         </section>
-      `;
+      `,
+        renderSessionLogSection()
+      ].filter(Boolean).join('');
       return;
     }
 
@@ -169,6 +266,9 @@
         </section>
       `);
     }
+
+    const sessionLogSection = renderSessionLogSection();
+    if (sessionLogSection) htmlParts.push(sessionLogSection);
 
     body.innerHTML = htmlParts.join('');
   }
@@ -352,6 +452,7 @@
 
   function updateFooterButtons() {
     const pauseBtn = document.getElementById('dfs-pause-btn');
+    const retryFailedBtn = document.getElementById('dfs-retry-failed-btn');
     const retryBtn = document.getElementById('dfs-retry-btn');
     const continueBtn = document.getElementById('dfs-continue-btn');
     const canAssumeSent = !(
@@ -366,10 +467,21 @@
       pauseBtn.disabled = !hasPendingWork() && state.phase !== 'paused';
     }
 
+    const canRetryFailedOnly = hasCurrentBatch() &&
+      state.phase === 'error' &&
+      Boolean(state.lastFailureContext?.canRetryFailedOnly);
+
+    if (retryFailedBtn) {
+      retryFailedBtn.hidden = !canRetryFailedOnly;
+      retryFailedBtn.disabled = !canRetryFailedOnly;
+      retryFailedBtn.classList.toggle('spacer', canRetryFailedOnly);
+    }
+
     if (retryBtn) {
       const canRetry = hasCurrentBatch() && ['awaiting_send', 'paused', 'error'].includes(state.phase);
       retryBtn.hidden = !canRetry;
       retryBtn.disabled = !canRetry;
+      retryBtn.classList.toggle('spacer', !canRetryFailedOnly && canRetry);
     }
 
     if (continueBtn) {
@@ -444,12 +556,18 @@
   }
 
   function updateAll() {
-    refreshTotalBatches();
-    updateHeaderChips();
-    updateTabLabels();
-    updateButtonState();
-    updateFooterButtons();
-    renderActiveTab();
+    const composerAttachmentCount = getComposerAttachmentCount();
+    setRenderSnapshot?.({ composerAttachmentCount });
+    try {
+      refreshTotalBatches();
+      updateHeaderChips();
+      updateTabLabels();
+      updateButtonState();
+      updateFooterButtons();
+      renderActiveTab();
+    } finally {
+      setRenderSnapshot?.(null);
+    }
   }
 
   function showDrawer(tabName = ui.activeTab || 'queue') {

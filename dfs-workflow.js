@@ -26,6 +26,7 @@
     hasPendingWork,
     getConfiguredBatchSize,
     getEffectiveBatchSize,
+    getInjectableBatchSize,
     queueStartsWithCurrentBatch,
     getQueuedCountAfterCurrentBatch,
     getCurrentBatchNumber,
@@ -64,6 +65,7 @@
   const MIN_ADAPTIVE_BATCH_SIZE = 5;
   const SERVER_BUSY_SHRINK_THRESHOLD = 2;
   const SUCCESSFUL_BATCHES_TO_RESTORE = 2;
+  const SESSION_LOG_LIMIT = 20;
 
   function setNativeValue(element, value) {
     const proto = Object.getPrototypeOf(element);
@@ -124,6 +126,196 @@
       return `检测到附件异常状态，正在等待页面恢复后重试 (${attempt}/${total})…`;
     }
     return `附件仍在解析，正在重试确认 (${attempt}/${total})…`;
+  }
+
+  function getCurrentBatchFileNames(batchItems = state.currentBatch) {
+    return Array.isArray(batchItems)
+      ? batchItems.map(item => item?.name).filter(Boolean)
+      : [];
+  }
+
+  function getSessionLogEntry(logId = state.currentBatchLogId) {
+    if (!logId) return null;
+    return state.sessionLog.find(entry => entry.id === logId) || null;
+  }
+
+  function ensureCurrentBatchLog(options = {}) {
+    const now = new Date().toISOString();
+    const fileNames = getCurrentBatchFileNames(options.batchItems);
+    const existingEntry = getSessionLogEntry();
+
+    if (existingEntry) {
+      existingEntry.batchNumber = Math.max(existingEntry.batchNumber || 0, getCurrentBatchNumber(), state.completedBatches + 1, 1);
+      existingEntry.totalBatchesSnapshot = Math.max(existingEntry.totalBatchesSnapshot || 0, state.totalBatches || 0, existingEntry.batchNumber);
+      existingEntry.fileNames = fileNames;
+      existingEntry.fileCount = fileNames.length;
+      existingEntry.mode = options.mode || existingEntry.mode || state.uploadMode;
+      existingEntry.source = state.uploadSource;
+      existingEntry.updatedAt = now;
+      return existingEntry;
+    }
+
+    state.sessionLogSequence += 1;
+    const batchNumber = Math.max(getCurrentBatchNumber(), state.completedBatches + 1, 1);
+    const entry = {
+      id: `batch-${state.sessionLogSequence}`,
+      batchNumber,
+      totalBatchesSnapshot: Math.max(state.totalBatches || 0, batchNumber),
+      fileNames,
+      fileCount: fileNames.length,
+      mode: options.mode || state.uploadMode,
+      source: state.uploadSource,
+      status: options.status || 'injecting',
+      errorType: '',
+      notes: '',
+      startedAt: now,
+      sentAt: '',
+      settledAt: '',
+      updatedAt: now
+    };
+
+    state.sessionLog.unshift(entry);
+    state.sessionLog = state.sessionLog.slice(0, SESSION_LOG_LIMIT);
+    state.currentBatchLogId = entry.id;
+    return entry;
+  }
+
+  function setCurrentBatchLogStatus(status, options = {}) {
+    const entry = ensureCurrentBatchLog(options);
+    if (!entry) return null;
+
+    const now = new Date().toISOString();
+    entry.status = status;
+    entry.updatedAt = now;
+    entry.fileNames = getCurrentBatchFileNames(options.batchItems);
+    entry.fileCount = entry.fileNames.length;
+    entry.mode = options.mode || entry.mode || state.uploadMode;
+    entry.source = state.uploadSource;
+
+    if (options.clearError) {
+      entry.errorType = '';
+      entry.notes = '';
+    }
+    if (typeof options.errorType === 'string') entry.errorType = options.errorType;
+    if (typeof options.notes === 'string') entry.notes = options.notes;
+    if (options.markSentAt) entry.sentAt = now;
+    if (options.markSettledAt) entry.settledAt = now;
+
+    return entry;
+  }
+
+  function finalizeCurrentBatchLog(status, options = {}) {
+    const entry = setCurrentBatchLogStatus(status, {
+      ...options,
+      markSettledAt: true,
+      clearError: options.clearError !== false
+    });
+    state.currentBatchLogId = '';
+    return entry;
+  }
+
+  function clearCurrentBatchLogLink() {
+    state.currentBatchLogId = '';
+  }
+
+  function clearFailureContext() {
+    state.lastFailureContext = null;
+  }
+
+  function setFailureContext(context) {
+    state.lastFailureContext = context || null;
+    return state.lastFailureContext;
+  }
+
+  function getNormalizedBatchFileNames(batchItems = state.currentBatch) {
+    return Array.isArray(batchItems)
+      ? batchItems.map(item => String(item?.name || '').trim().toLowerCase()).filter(Boolean)
+      : [];
+  }
+
+  function hasDuplicateBatchFileNames(batchItems = state.currentBatch) {
+    const fileNames = getNormalizedBatchFileNames(batchItems);
+    return fileNames.length !== new Set(fileNames).size;
+  }
+
+  function buildRetryableFailureContext(options = {}) {
+    const failedNames = Array.isArray(options.failedNames)
+      ? Array.from(new Set(options.failedNames.filter(Boolean)))
+      : [];
+    if (!failedNames.length || !hasCurrentBatch()) return null;
+    if (hasDuplicateBatchFileNames()) return null;
+
+    const failedNameSet = new Set(failedNames);
+    const failedItems = state.currentBatch.filter(item => failedNameSet.has(item?.name));
+    const deferredItems = state.currentBatch.filter(item => !failedNameSet.has(item?.name));
+
+    if (!failedItems.length || !deferredItems.length) return null;
+
+    return {
+      type: options.type || 'failed_items_only',
+      errorType: options.errorType || 'attachment_error',
+      failedNames,
+      failedCount: failedItems.length,
+      deferredCount: deferredItems.length,
+      canRetryFailedOnly: true
+    };
+  }
+
+  function startNextBatchSafely(mode = state.uploadMode) {
+    return startNextBatch(mode).catch(error => {
+      console.warn('[DFS Uploader] startNextBatch() 出现未处理异常。', error);
+    });
+  }
+
+  function getQueueWithoutCurrentBatchItems(batchItems = state.currentBatch) {
+    const currentItems = Array.isArray(batchItems) ? batchItems : [];
+    if (!currentItems.length) return state.queue.slice();
+    if (queueStartsWithCurrentBatch()) {
+      return state.queue.slice(currentItems.length);
+    }
+    return state.queue.filter(item => !currentItems.includes(item));
+  }
+
+  function prepareFailedItemsRetryContext(context = state.lastFailureContext) {
+    if (!context?.canRetryFailedOnly || !hasCurrentBatch()) return null;
+
+    const currentBatchItems = state.currentBatch.slice();
+    const failedNameSet = new Set(context.failedNames || []);
+    const failedItems = currentBatchItems.filter(item => failedNameSet.has(item?.name));
+    const deferredItems = currentBatchItems.filter(item => !failedNameSet.has(item?.name));
+
+    if (!failedItems.length || !deferredItems.length) {
+      clearFailureContext();
+      return null;
+    }
+
+    const queueTail = getQueueWithoutCurrentBatchItems(currentBatchItems);
+    const currentLogEntry = getSessionLogEntry();
+    if (currentLogEntry) {
+      finalizeCurrentBatchLog('failed', {
+        batchItems: currentBatchItems,
+        errorType: currentLogEntry.errorType || context.errorType || 'attachment_error',
+        notes: `${currentLogEntry.notes ? `${currentLogEntry.notes} ` : ''}用户选择仅重试失败文件；其余 ${deferredItems.length} 个文件已回到待处理队列。`,
+        clearError: false
+      });
+    } else {
+      clearCurrentBatchLogLink();
+    }
+
+    state.currentBatch = failedItems;
+    state.queue = failedItems.concat(deferredItems, queueTail);
+    state.currentBatchExpectedAttachments = failedItems.length;
+    state.currentBatchDetectedAttachments = 0;
+    state.currentBatchAttachmentsConfirmed = false;
+    state.currentBatchUsedAutoContext = false;
+    clearFailureContext();
+    refreshTotalBatches();
+
+    return {
+      failedItems,
+      deferredItems,
+      queueTail
+    };
   }
 
   function getAdaptiveBatchFloor() {
@@ -516,6 +708,10 @@
     state.lastSettledBatchSize = 0;
     state.nextBatchReadyAt = 0;
     state.composerBaselineAttachments = 0;
+    state.currentBatchLogId = '';
+    state.sessionLogSequence = 0;
+    state.sessionLog = [];
+    clearFailureContext();
     resetAdaptiveBatching();
     resetBatchAttachmentStatus();
   }
@@ -538,11 +734,17 @@
     clearSettlementTimer();
     clearAdvanceTimer();
     if (!hasCurrentBatch()) return;
+    const settledBatchItems = state.currentBatch.slice();
     const settledBatchSize = state.currentBatch.length;
 
     if (queueStartsWithCurrentBatch()) {
       state.queue = state.queue.slice(state.currentBatch.length);
     }
+    finalizeCurrentBatchLog(assumed ? 'assumed_sent' : 'sent', {
+      batchItems: settledBatchItems,
+      notes: assumed ? '本批次由用户手动标记为已发送。' : '',
+      clearError: true
+    });
     state.completedBatches += 1;
     state.currentBatch = [];
     registerSuccessfulBatch();
@@ -551,6 +753,7 @@
     state.isPaused = false;
     state.phase = state.queue.length ? 'queued' : 'done';
     state.errorMessage = assumed ? '' : '';
+    clearFailureContext();
     state.composerBaselineAttachments = getComposerAttachmentCount();
     resetBatchAttachmentStatus();
     updateAll();
@@ -569,7 +772,16 @@
     clearAdvanceTimer();
     state.phase = 'error';
     state.errorMessage = message;
-    if (!preserveBatch) state.currentBatch = [];
+    if (options.failureContext) setFailureContext(options.failureContext);
+    else if (options.clearFailureContext !== false) clearFailureContext();
+    setCurrentBatchLogStatus('failed', {
+      errorType: options.errorType || 'batch_error',
+      notes: message
+    });
+    if (!preserveBatch) {
+      state.currentBatch = [];
+      clearCurrentBatchLogLink();
+    }
     updateAll();
     showDrawer('queue');
   }
@@ -620,6 +832,9 @@
         state.errorMessage = optimistic
           ? '未能自动确认发送完成。请检查当前批次；如果已成功发出，请点击“标记已发”。'
           : '未能确认发送完成，请手动检查当前批次。';
+        setCurrentBatchLogStatus('awaiting_send', {
+          notes: state.errorMessage
+        });
         updateAll();
         showDrawer('queue');
         return;
@@ -641,6 +856,11 @@
     clearAdvanceTimer();
     state.phase = 'sending';
     state.errorMessage = '';
+    setCurrentBatchLogStatus('sending', {
+      markSentAt: true,
+      clearError: true,
+      notes: '用户手动触发了发送。'
+    });
     updateAll();
     startSettlementWatcher(state.runToken, true);
   }
@@ -674,6 +894,7 @@
         const matchedNames = attachmentState.matchedNames;
         const inputFileCount = attachmentState.inputFileCount;
         const detected = Math.max(increase, matchedNames, inputFileCount);
+        const canUseNameMatchConfirmation = !attachmentState.hasDuplicateBatchNames;
 
         if (attachmentState.failedAttachments > 0) {
           finish({
@@ -689,7 +910,7 @@
 
         if (
           currentCount >= state.composerBaselineAttachments + minimumIncrease ||
-          matchedNames >= expectedFiles ||
+          (canUseNameMatchConfirmation && matchedNames >= expectedFiles) ||
           (inputFileCount >= expectedFiles && (currentCount > state.composerBaselineAttachments || matchedNames > 0))
         ) {
           finish({ confirmed: true, increase: detected, failed: 0, blockedByError: false, serverBusy: false });
@@ -748,6 +969,9 @@
       const textarea = findComposerTextarea();
       if (!textarea) {
         state.errorMessage = '未找到输入框，已切换到手动发送。';
+        setCurrentBatchLogStatus('awaiting_send', {
+          notes: state.errorMessage
+        });
         resolve(false);
         return;
       }
@@ -778,6 +1002,9 @@
 
         if (hasAttachmentErrorIndicators()) {
           state.errorMessage = '检测到当前批次存在上传失败的附件（例如“服务器繁忙”或“重试”）。请先清空失败附件，再重新发送当前批次。';
+          setCurrentBatchLogStatus('awaiting_send', {
+            notes: state.errorMessage
+          });
           finish(false);
           return;
         }
@@ -786,6 +1013,11 @@
         if (sendBtn && !isControlDisabled(sendBtn)) {
           try {
             state.phase = 'sending';
+            setCurrentBatchLogStatus('sending', {
+              markSentAt: true,
+              clearError: true,
+              notes: '插件已自动触发发送。'
+            });
             updateAll();
             sendBtn.click();
             startSettlementWatcher(runToken, true);
@@ -793,6 +1025,9 @@
             return;
           } catch (error) {
             state.errorMessage = '自动点击发送失败，请手动发送当前批次。';
+            setCurrentBatchLogStatus('awaiting_send', {
+              notes: state.errorMessage
+            });
             finish(false);
             return;
           }
@@ -804,6 +1039,11 @@
 
         if (!sendBtn && submitComposerForm()) {
           state.phase = 'sending';
+          setCurrentBatchLogStatus('sending', {
+            markSentAt: true,
+            clearError: true,
+            notes: '插件已通过表单提交触发发送。'
+          });
           updateAll();
           startSettlementWatcher(runToken, true);
           finish(true);
@@ -811,6 +1051,9 @@
         }
 
         state.errorMessage = '发送按钮长时间不可用，附件可能仍在解析中。请稍等片刻后手动发送当前批次。';
+        setCurrentBatchLogStatus('awaiting_send', {
+          notes: state.errorMessage
+        });
         finish(false);
       };
 
@@ -836,13 +1079,19 @@
 
     if (attachmentsPresent && !state.currentBatchAttachmentsConfirmed) {
       enterErrorState(
-        `当前批次仅确认到 ${state.currentBatchDetectedAttachments || composerCount - state.composerBaselineAttachments}/${Math.max(state.currentBatchExpectedAttachments, state.currentBatch.length)} 个附件。请先手动清理输入框中的残留附件，再点击“重试本批”。`
+        `当前批次仅确认到 ${state.currentBatchDetectedAttachments || composerCount - state.composerBaselineAttachments}/${Math.max(state.currentBatchExpectedAttachments, state.currentBatch.length)} 个附件。请先手动清理输入框中的残留附件，再点击“重试本批”。`,
+        { errorType: 'attachment_confirm_incomplete', clearFailureContext: false }
       );
       return;
     }
 
     if (attachmentsPresent) {
+      clearFailureContext();
       state.phase = 'awaiting_send';
+      setCurrentBatchLogStatus('awaiting_send', {
+        clearError: true,
+        notes: '正在重新尝试发送当前批次。'
+      });
       updateAll();
       showDrawer('queue');
 
@@ -860,11 +1109,16 @@
       return;
     }
 
+    clearFailureContext();
     state.phase = 'injecting';
     state.composerBaselineAttachments = composerCount;
     state.currentBatchExpectedAttachments = state.currentBatch.length;
     state.currentBatchDetectedAttachments = 0;
     state.currentBatchAttachmentsConfirmed = false;
+    setCurrentBatchLogStatus('injecting', {
+      clearError: true,
+      notes: '正在重新注入当前批次附件。'
+    });
     updateAll();
     showDrawer('queue');
 
@@ -880,22 +1134,35 @@
       if (!attachmentResult.confirmed) {
         if (attachmentResult.blockedByError) {
           const adaptiveAdjustment = registerAdaptiveFailure({ serverBusy: attachmentResult.serverBusy });
+          const failureContext = buildRetryableFailureContext({
+            failedNames: attachmentResult.failedNames,
+            errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error'
+          });
           enterErrorState(
             attachmentResult.serverBusy
               ? `检测到当前批次命中了“服务器繁忙”，并已按更长退避重试 3 轮后仍未恢复。${getAdaptiveBatchingMessage(adaptiveAdjustment)}请先清空输入框中的失败附件，稍等几秒后再点击“重试本批”。`
-              : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。请先清空输入框中的失败附件，稍等几秒后再点击“重试本批”。'
+              : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。请先清空输入框中的失败附件，稍等几秒后再点击“重试本批”。',
+            {
+              errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error',
+              failureContext
+            }
           );
           return;
         }
         registerAdaptiveFailure();
         enterErrorState(
-          `仅确认到 ${attachmentResult.increase}/${state.currentBatch.length} 个附件。为避免丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`
+          `仅确认到 ${attachmentResult.increase}/${state.currentBatch.length} 个附件。为避免丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`,
+          { errorType: 'attachment_confirm_incomplete' }
         );
         return;
       }
 
       state.errorMessage = '';
       state.phase = 'awaiting_send';
+      setCurrentBatchLogStatus('awaiting_send', {
+        clearError: true,
+        notes: '附件确认完成，等待发送。'
+      });
       updateAll();
       showDrawer('queue');
 
@@ -913,8 +1180,34 @@
     } catch (error) {
       if (runToken !== state.runToken) return;
       registerAdaptiveFailure();
-      enterErrorState(error.message || '重试失败，请手动发送或继续。');
+      enterErrorState(error.message || '重试失败，请手动发送或继续。', {
+        errorType: 'retry_failure'
+      });
     }
+  }
+
+  async function retryFailedItemsOnly() {
+    if (!hasCurrentBatch() || !state.lastFailureContext?.canRetryFailedOnly) return;
+
+    const retryPlan = prepareFailedItemsRetryContext();
+    if (!retryPlan) {
+      await retryCurrentBatch();
+      return;
+    }
+
+    const attachmentsPresent = getComposerAttachmentCount() > state.composerBaselineAttachments;
+    const retryNotice = `已切换为仅重试失败文件，共 ${retryPlan.failedItems.length} 个；其余 ${retryPlan.deferredItems.length} 个文件已回到待处理队列。`;
+
+    state.phase = 'error';
+    state.errorMessage = attachmentsPresent
+      ? `${retryNotice} 请先清空输入框中的残留附件，再点击“重试本批”。`
+      : retryNotice;
+    updateAll();
+    showDrawer('queue');
+
+    if (attachmentsPresent) return;
+
+    await retryCurrentBatch();
   }
 
   async function startNextBatch(mode = state.uploadMode) {
@@ -925,7 +1218,10 @@
     if (hasCurrentBatch()) {
       const attachmentsStillVisible = getComposerAttachmentCount() > state.composerBaselineAttachments;
       if (!state.currentBatchAttachmentsConfirmed && attachmentsStillVisible) {
-        enterErrorState('当前批次附件尚未确认完整。请先检查输入框中的附件；如有残留请先清空，再点击“重试本批”。');
+        enterErrorState('当前批次附件尚未确认完整。请先检查输入框中的附件；如有残留请先清空，再点击“重试本批”。', {
+          errorType: 'attachment_confirm_incomplete',
+          clearFailureContext: false
+        });
         return;
       }
       const prompt = attachmentsStillVisible
@@ -971,13 +1267,32 @@
     clearAllTimers();
     state.lastSettledBatchSize = 0;
     state.nextBatchReadyAt = 0;
-    state.currentBatch = state.queue.slice(0, Math.min(getEffectiveBatchSize(), MAX_FILES_PER_BATCH));
+    const composerAttachmentCount = getComposerAttachmentCount();
+    const nextBatchSize = Math.min(state.queue.length, getInjectableBatchSize(composerAttachmentCount));
+    if (nextBatchSize <= 0) {
+      state.phase = state.queue.length ? 'queued' : 'idle';
+      state.errorMessage = `当前输入框已有 ${composerAttachmentCount} 个附件，已达到 DeepSeek 的 ${MAX_FILES_PER_BATCH} 个附件上限。请先发送或清空输入框中的现有附件，再继续本轮上传。`;
+      updateAll();
+      showDrawer('queue');
+      return;
+    }
+    state.currentBatch = state.queue.slice(0, nextBatchSize);
     state.phase = 'injecting';
     state.errorMessage = '';
-    state.composerBaselineAttachments = getComposerAttachmentCount();
+    clearFailureContext();
+    state.composerBaselineAttachments = composerAttachmentCount;
     state.currentBatchExpectedAttachments = state.currentBatch.length;
     state.currentBatchDetectedAttachments = 0;
     state.currentBatchAttachmentsConfirmed = false;
+    ensureCurrentBatchLog({
+      status: 'injecting',
+      batchItems: state.currentBatch
+    });
+    setCurrentBatchLogStatus('injecting', {
+      batchItems: state.currentBatch,
+      clearError: true,
+      notes: '开始注入当前批次附件。'
+    });
     updateAll();
     showDrawer('queue');
 
@@ -993,22 +1308,35 @@
       if (!attachmentResult.confirmed) {
         if (attachmentResult.blockedByError) {
           const adaptiveAdjustment = registerAdaptiveFailure({ serverBusy: attachmentResult.serverBusy });
+          const failureContext = buildRetryableFailureContext({
+            failedNames: attachmentResult.failedNames,
+            errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error'
+          });
           enterErrorState(
             attachmentResult.serverBusy
               ? `检测到当前批次命中了“服务器繁忙”，并已按更长退避重试 3 轮后仍未恢复。${getAdaptiveBatchingMessage(adaptiveAdjustment)}为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。`
-              : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。'
+              : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。',
+            {
+              errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error',
+              failureContext
+            }
           );
           return;
         }
         registerAdaptiveFailure();
         enterErrorState(
-          `仅确认到 ${attachmentResult.increase}/${state.currentBatch.length} 个附件。为避免静默丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`
+          `仅确认到 ${attachmentResult.increase}/${state.currentBatch.length} 个附件。为避免静默丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`,
+          { errorType: 'attachment_confirm_incomplete' }
         );
         return;
       }
 
       state.errorMessage = '';
       state.phase = 'awaiting_send';
+      setCurrentBatchLogStatus('awaiting_send', {
+        clearError: true,
+        notes: '附件确认完成，等待发送。'
+      });
       updateAll();
       showDrawer('queue');
 
@@ -1026,7 +1354,10 @@
     } catch (error) {
       if (runToken !== state.runToken) return;
       registerAdaptiveFailure();
-      enterErrorState(error.message || '上传失败，请重试。', { preserveBatch: false });
+      enterErrorState(error.message || '上传失败，请重试。', {
+        preserveBatch: false,
+        errorType: 'inject_failure'
+      });
     }
   }
 
@@ -1038,9 +1369,14 @@
       if (state.phase === 'paused') {
         state.phase = hasCurrentBatch() ? 'awaiting_send' : (state.queue.length ? 'queued' : 'idle');
       }
+      if (hasCurrentBatch()) {
+        setCurrentBatchLogStatus('awaiting_send', {
+          notes: '流程已恢复，等待继续处理当前批次。'
+        });
+      }
       updateAll();
       if (!hasCurrentBatch() && state.queue.length && state.uploadMode === 'auto') {
-        startNextBatch(state.uploadMode);
+        startNextBatchSafely(state.uploadMode);
         return;
       }
       showDrawer('queue');
@@ -1053,10 +1389,17 @@
 
     if (state.phase === 'injecting') {
       bumpRunToken();
+      setCurrentBatchLogStatus('paused', {
+        notes: '注入过程中已暂停，当前批次已回退到待处理队列。'
+      });
       restoreCurrentBatchToQueue();
+      clearCurrentBatchLogLink();
       state.phase = state.queue.length ? 'paused' : 'idle';
     } else if (hasCurrentBatch()) {
       bumpRunToken();
+      setCurrentBatchLogStatus('paused', {
+        notes: '已暂停，当前批次保留在输入区等待继续。'
+      });
       state.phase = 'paused';
     } else {
       state.phase = 'paused';
@@ -1111,7 +1454,7 @@
     showDrawer('queue');
 
     if (queue.length) {
-      startNextBatch(state.uploadMode);
+      startNextBatchSafely(state.uploadMode);
     }
   }
 
@@ -1275,6 +1618,16 @@
     getRemainingBatchCooldownMs,
     describeBatchCooldown,
     getAttachmentRetryDelayMs,
+    getSessionLogEntry,
+    ensureCurrentBatchLog,
+    setCurrentBatchLogStatus,
+    finalizeCurrentBatchLog,
+    clearCurrentBatchLogLink,
+    clearFailureContext,
+    setFailureContext,
+    hasDuplicateBatchFileNames,
+    buildRetryableFailureContext,
+    prepareFailedItemsRetryContext,
     resetAdaptiveBatching,
     registerAdaptiveFailure,
     registerSuccessfulBatch,
@@ -1298,6 +1651,7 @@
     injectFiles,
     attemptAutoSend,
     retryCurrentBatch,
+    retryFailedItemsOnly,
     startNextBatch,
     togglePause,
     clearQueue,
@@ -1315,6 +1669,16 @@
     getRemainingBatchCooldownMs,
     describeBatchCooldown,
     getAttachmentRetryDelayMs,
+    getSessionLogEntry,
+    ensureCurrentBatchLog,
+    setCurrentBatchLogStatus,
+    finalizeCurrentBatchLog,
+    clearCurrentBatchLogLink,
+    clearFailureContext,
+    setFailureContext,
+    hasDuplicateBatchFileNames,
+    buildRetryableFailureContext,
+    prepareFailedItemsRetryContext,
     resetAdaptiveBatching,
     registerAdaptiveFailure,
     registerSuccessfulBatch,

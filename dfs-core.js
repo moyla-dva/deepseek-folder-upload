@@ -123,6 +123,10 @@
     sessionBatchSize: 0,
     consecutiveServerBusyCount: 0,
     consecutiveSuccessfulBatches: 0,
+    currentBatchLogId: '',
+    sessionLogSequence: 0,
+    sessionLog: [],
+    lastFailureContext: null,
     settleTimerId: null,
     settleCleanup: null,
     advanceTimerId: null,
@@ -143,6 +147,7 @@
     drawer: null,
     wrapper: null,
     activeTab: 'queue',
+    renderSnapshot: null,
     placementTimerId: null,
     placementObserver: null,
     filePickerInput: null,
@@ -157,9 +162,18 @@
 
   const domCache = {
     version: 0,
+    invalidationScheduled: false,
     simple: new Map(),
     attachments: new WeakMap()
   };
+
+  function enqueueMicrotask(callback) {
+    if (typeof queueMicrotask === 'function') {
+      queueMicrotask(callback);
+      return;
+    }
+    Promise.resolve().then(callback);
+  }
 
   function normalizeExtension(ext) {
     const value = String(ext || '').trim().toLowerCase();
@@ -185,10 +199,74 @@
     return Math.min(configuredBatchSize, Math.max(1, sessionBatchSize));
   }
 
+  function normalizeAttachmentCount(count) {
+    const normalized = Number.isFinite(Number(count)) ? Number(count) : 0;
+    return Math.min(MAX_FILES_PER_BATCH, Math.max(0, Math.round(normalized)));
+  }
+
+  function getKnownComposerAttachmentCount() {
+    if (Number.isFinite(ui.renderSnapshot?.composerAttachmentCount)) {
+      return normalizeAttachmentCount(ui.renderSnapshot.composerAttachmentCount);
+    }
+    return normalizeAttachmentCount(
+      typeof shared.getComposerAttachmentCount === 'function'
+        ? shared.getComposerAttachmentCount()
+        : 0
+    );
+  }
+
+  function setRenderSnapshot(snapshot = null) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      ui.renderSnapshot = null;
+      return;
+    }
+    ui.renderSnapshot = { ...snapshot };
+  }
+
+  function getAvailableAttachmentSlots(existingAttachments = getKnownComposerAttachmentCount()) {
+    return Math.max(0, MAX_FILES_PER_BATCH - normalizeAttachmentCount(existingAttachments));
+  }
+
+  function getInjectableBatchSize(existingAttachments = getKnownComposerAttachmentCount(), batchSize = getEffectiveBatchSize()) {
+    const safeBatchSize = Math.min(MAX_FILES_PER_BATCH, Math.max(1, parseInt(batchSize, 10) || MAX_FILES_PER_BATCH));
+    return Math.min(safeBatchSize, getAvailableAttachmentSlots(existingAttachments));
+  }
+
+  function getProjectedBatchCount(fileCount = state.queue.length, options = {}) {
+    const pendingCount = Math.max(0, parseInt(fileCount, 10) || 0);
+    if (!pendingCount) return 0;
+
+    const batchSize = Math.min(MAX_FILES_PER_BATCH, Math.max(1, parseInt(options.batchSize, 10) || getEffectiveBatchSize()));
+    if (options.currentBatchSize != null) {
+      const currentBatchSize = Math.max(0, parseInt(options.currentBatchSize, 10) || 0);
+      if (!currentBatchSize) return Math.ceil(pendingCount / batchSize);
+      if (pendingCount <= currentBatchSize) return 1;
+      return 1 + Math.ceil((pendingCount - currentBatchSize) / batchSize);
+    }
+
+    const firstBatchCapacity = options.firstBatchCapacity != null
+      ? Math.max(0, parseInt(options.firstBatchCapacity, 10) || 0)
+      : getInjectableBatchSize(options.existingAttachments, batchSize);
+
+    if (!firstBatchCapacity) return Math.ceil(pendingCount / batchSize);
+    if (pendingCount <= firstBatchCapacity) return 1;
+    return 1 + Math.ceil((pendingCount - firstBatchCapacity) / batchSize);
+  }
+
   function invalidateDomCache() {
+    domCache.invalidationScheduled = false;
     domCache.version += 1;
     domCache.simple.clear();
     domCache.attachments = new WeakMap();
+  }
+
+  function scheduleDomCacheInvalidation() {
+    if (domCache.invalidationScheduled) return;
+    domCache.invalidationScheduled = true;
+    enqueueMicrotask(() => {
+      if (!domCache.invalidationScheduled) return;
+      invalidateDomCache();
+    });
   }
 
   function getCachedDomValue(key, compute) {
@@ -327,8 +405,13 @@
     }
     state.totalBatches = state.completedBatches + (
       queueStartsWithCurrentBatch()
-        ? Math.ceil(state.queue.length / batchSize)
-        : (hasCurrentBatch() ? 1 : 0) + Math.ceil(state.queue.length / batchSize)
+        ? getProjectedBatchCount(state.queue.length, {
+          batchSize,
+          currentBatchSize: state.currentBatch.length
+        })
+        : hasCurrentBatch()
+          ? 1 + Math.ceil(state.queue.length / batchSize)
+          : getProjectedBatchCount(state.queue.length, { batchSize })
     );
   }
 
@@ -339,7 +422,7 @@
       source: state.uploadSource,
       acceptedCount,
       skippedCount,
-      batches: Math.ceil(acceptedCount / state.config.batchSize)
+      batches: getProjectedBatchCount(acceptedCount)
     });
     state.history = state.history.slice(0, 5);
   }
@@ -443,16 +526,36 @@
   }
 
   function getNoticeMarkup() {
+    const notices = [];
+
     if (state.errorMessage) {
-      return `<div class="dfs-notice ${state.phase === 'error' ? 'error' : 'warning'}">${escapeHtml(state.errorMessage)}</div>`;
+      notices.push(`<div class="dfs-notice ${state.phase === 'error' ? 'error' : 'warning'}">${escapeHtml(state.errorMessage)}</div>`);
     }
-    if (state.phase === 'awaiting_send') {
-      return '<div class="dfs-notice warning">当前批次已进入输入框。插件会优先尝试发送；如果页面没有识别到发送动作，可以点击“继续”标记为已发送。</div>';
+    if (
+      state.phase === 'error' &&
+      hasCurrentBatch() &&
+      typeof shared.hasDuplicateBatchFileNames === 'function' &&
+      shared.hasDuplicateBatchFileNames()
+    ) {
+      notices.push('<div class="dfs-notice muted">当前批次含同名文件，暂不支持“仅重试失败项”。为避免误判，请先使用“重试本批”。</div>');
     }
-    if (state.phase === 'paused' && hasCurrentBatch()) {
-      return '<div class="dfs-notice muted">自动推进已暂停。当前批次仍保留在输入区，处理完成后点击“继续”即可。</div>';
+    if (!notices.length && !hasCurrentBatch() && state.queue.length) {
+      const composerAttachmentCount = getKnownComposerAttachmentCount();
+      const injectableBatchSize = getInjectableBatchSize(composerAttachmentCount);
+      if (composerAttachmentCount >= MAX_FILES_PER_BATCH) {
+        notices.push(`<div class="dfs-notice warning">当前输入框已有 ${composerAttachmentCount} 个附件，已达到 ${MAX_FILES_PER_BATCH} 个附件上限。请先发送或清空后，再继续注入待处理队列。</div>`);
+      }
+      if (!notices.length && composerAttachmentCount > 0 && injectableBatchSize > 0 && injectableBatchSize < Math.min(getEffectiveBatchSize(), state.queue.length)) {
+        notices.push(`<div class="dfs-notice muted">当前输入框已有 ${composerAttachmentCount} 个附件。本轮首批会自动缩到 ${injectableBatchSize} 个文件，避免超过 ${MAX_FILES_PER_BATCH} 个附件上限。</div>`);
+      }
     }
-    return '';
+    if (!notices.length && state.phase === 'awaiting_send') {
+      notices.push('<div class="dfs-notice warning">当前批次已进入输入框。插件会优先尝试发送；如果页面没有识别到发送动作，可以点击“继续”标记为已发送。</div>');
+    }
+    if (!notices.length && state.phase === 'paused' && hasCurrentBatch()) {
+      notices.push('<div class="dfs-notice muted">自动推进已暂停。当前批次仍保留在输入区，处理完成后点击“继续”即可。</div>');
+    }
+    return notices.join('');
   }
 
   function renderFileChip(item, options = {}) {
@@ -502,7 +605,13 @@
     normalizeBatchIntervalSeconds,
     getConfiguredBatchSize,
     getEffectiveBatchSize,
+    getKnownComposerAttachmentCount,
+    getAvailableAttachmentSlots,
+    getInjectableBatchSize,
+    getProjectedBatchCount,
+    setRenderSnapshot,
     invalidateDomCache,
+    scheduleDomCacheInvalidation,
     getCachedDomValue,
     getCachedAttachmentElements,
     hasCurrentBatch,

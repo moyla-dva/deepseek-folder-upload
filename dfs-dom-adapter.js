@@ -17,7 +17,7 @@
     ATTACHMENT_SELECTORS,
     state,
     ui,
-    invalidateDomCache,
+    scheduleDomCacheInvalidation,
     getCachedDomValue,
     getCachedAttachmentElements
   } = shared;
@@ -30,10 +30,12 @@
     LOCAL_COMPOSER_ROW_TOLERANCE: 28,
     SHARED_CONTAINER_MIN_CONTROLS: 2,
     SHARED_CONTAINER_MAX_CONTROLS: 8,
+    ATTACHMENT_ROOT_MAX_ANCESTOR_STEPS: 4,
     COMPOSER_ROOT_MIN_WIDTH: 260,
     COMPOSER_ROOT_MIN_HEIGHT: 80,
     COMPOSER_ROOT_MAX_VIEWPORT_HEIGHT_RATIO: 0.7,
     COMPOSER_ROOT_MAX_CHILDREN: 35,
+    COMPOSER_ROOT_NEAR_ANCESTOR_MAX_DISTANCE: 4,
     NATIVE_UPLOAD_CLOSE_CENTER_OFFSET: 56,
     NATIVE_UPLOAD_NEAR_LEFT_EDGE_OFFSET: 20,
     NATIVE_UPLOAD_SEND_GAP_TIGHT: 16,
@@ -46,8 +48,10 @@
     CONTROLS_AT_LEAST_FIVE: 3,
     ACTION_BUTTONS_AT_LEAST_ONE: 5,
     ACTION_BUTTONS_AT_LEAST_TWO: 6,
-    ATTACHMENTS_PRESENT: 9,
     TEXT_HINT: 6,
+    TEXTAREA_PARENT: 8,
+    TEXTAREA_NEAR_ANCESTOR: 4,
+    DISTANT_ANCESTOR_PENALTY: -5,
     MIN_WIDTH: 2,
     MIN_HEIGHT: 2,
     TOO_TALL_PENALTY: -6,
@@ -118,8 +122,13 @@
     if ((features.controlsCount || 0) >= 5) score += COMPOSER_ROOT_SCORE.CONTROLS_AT_LEAST_FIVE;
     if ((features.actionButtonsCount || 0) >= 1) score += COMPOSER_ROOT_SCORE.ACTION_BUTTONS_AT_LEAST_ONE;
     if ((features.actionButtonsCount || 0) >= 2) score += COMPOSER_ROOT_SCORE.ACTION_BUTTONS_AT_LEAST_TWO;
-    if ((features.attachmentsCount || 0) > 0) score += COMPOSER_ROOT_SCORE.ATTACHMENTS_PRESENT;
     if (features.hasTextHint) score += COMPOSER_ROOT_SCORE.TEXT_HINT;
+    if (features.ancestorDistance === 1) score += COMPOSER_ROOT_SCORE.TEXTAREA_PARENT;
+    else if ((features.ancestorDistance || 0) > 1 && features.ancestorDistance <= DOM_TUNING.COMPOSER_ROOT_NEAR_ANCESTOR_MAX_DISTANCE) {
+      score += COMPOSER_ROOT_SCORE.TEXTAREA_NEAR_ANCESTOR;
+    } else if ((features.ancestorDistance || 0) > DOM_TUNING.COMPOSER_ROOT_NEAR_ANCESTOR_MAX_DISTANCE) {
+      score += COMPOSER_ROOT_SCORE.DISTANT_ANCESTOR_PENALTY;
+    }
     if ((features.width || 0) >= DOM_TUNING.COMPOSER_ROOT_MIN_WIDTH) score += COMPOSER_ROOT_SCORE.MIN_WIDTH;
     if ((features.height || 0) >= DOM_TUNING.COMPOSER_ROOT_MIN_HEIGHT) score += COMPOSER_ROOT_SCORE.MIN_HEIGHT;
     if ((features.viewportHeight || 0) > 0 && (features.height || 0) > features.viewportHeight * DOM_TUNING.COMPOSER_ROOT_MAX_VIEWPORT_HEIGHT_RATIO) {
@@ -259,6 +268,20 @@
     return Boolean(anchor.compareDocumentPosition(target) & Node.DOCUMENT_POSITION_FOLLOWING);
   }
 
+  function getAncestorDistance(descendant, ancestor) {
+    if (!(descendant instanceof HTMLElement) || !(ancestor instanceof HTMLElement)) return Number.POSITIVE_INFINITY;
+    let distance = 0;
+    let node = descendant.parentElement;
+
+    while (node && node !== document.body) {
+      distance += 1;
+      if (node === ancestor) return distance;
+      node = node.parentElement;
+    }
+
+    return Number.POSITIVE_INFINITY;
+  }
+
   function getVisibleControls(root) {
     if (!(root instanceof HTMLElement)) return [];
     return Array.from(root.querySelectorAll('button, [role="button"], input[type="submit"]')).filter(control => (
@@ -268,6 +291,19 @@
     ));
   }
 
+  function hasNestedAttachmentLikeChild(element) {
+    if (!(element instanceof HTMLElement)) return false;
+    return Array.from(element.children).some(child => {
+      if (!(child instanceof HTMLElement)) return false;
+      const childText = getElementText(child);
+      return Boolean(
+        childText &&
+        ATTACHMENT_NAME_RE.test(childText) &&
+        ATTACHMENT_SIZE_RE.test(childText)
+      );
+    });
+  }
+
   function findAttachmentContainer(element, root) {
     let node = element instanceof HTMLElement ? element : null;
     let best = null;
@@ -275,7 +311,12 @@
     while (node && node !== root && node !== document.body) {
       if (node.querySelector('textarea')) break;
       const text = getElementText(node);
-      if (ATTACHMENT_NAME_RE.test(text) && ATTACHMENT_SIZE_RE.test(text) && text.length <= DOM_TUNING.ATTACHMENT_TEXT_MAX_LENGTH) {
+      if (
+        ATTACHMENT_NAME_RE.test(text) &&
+        ATTACHMENT_SIZE_RE.test(text) &&
+        text.length <= DOM_TUNING.ATTACHMENT_TEXT_MAX_LENGTH &&
+        !hasNestedAttachmentLikeChild(node)
+      ) {
         best = node;
       }
       node = node.parentElement;
@@ -284,37 +325,65 @@
     return best || (element instanceof HTMLElement ? element : null);
   }
 
+  function getAttachmentSearchRoots(root, textarea = findComposerTextarea(), composerForm = getComposerForm()) {
+    if (!(textarea instanceof HTMLElement)) {
+      return root instanceof HTMLElement ? [root] : [];
+    }
+
+    const roots = [];
+    const seen = new Set();
+    const pushRoot = candidate => {
+      if (!(candidate instanceof HTMLElement) || seen.has(candidate)) return;
+      seen.add(candidate);
+      roots.push(candidate);
+    };
+
+    let node = textarea.parentElement;
+    let steps = 0;
+
+    while (node && node !== document.body) {
+      pushRoot(node);
+      if (node === composerForm || node.matches('form')) break;
+      steps += 1;
+      if (steps >= DOM_TUNING.ATTACHMENT_ROOT_MAX_ANCESTOR_STEPS) break;
+      node = node.parentElement;
+    }
+
+    pushRoot(composerForm);
+
+    if (!roots.length && root instanceof HTMLElement) {
+      pushRoot(root);
+    }
+
+    return roots;
+  }
+
   function collectAttachmentElements(root) {
     return getCachedAttachmentElements(root, () => {
       const set = new Set();
+      const searchRoots = getAttachmentSearchRoots(root);
 
-      ATTACHMENT_SELECTORS.forEach(selector => {
-        root.querySelectorAll(selector).forEach(element => {
-          const container = findAttachmentContainer(element, root);
-          if (container?.isConnected && !container.querySelector('textarea')) set.add(container);
+      searchRoots.forEach(searchRoot => {
+        ATTACHMENT_SELECTORS.forEach(selector => {
+          searchRoot.querySelectorAll(selector).forEach(element => {
+            const container = findAttachmentContainer(element, searchRoot);
+            if (container?.isConnected && !container.querySelector('textarea')) set.add(container);
+          });
         });
       });
 
-      root.querySelectorAll('div, li, article, section').forEach(element => {
-        if (!(element instanceof HTMLElement) || !isElementVisible(element)) return;
-        if (element.querySelector('textarea')) return;
+      searchRoots.forEach(searchRoot => {
+        searchRoot.querySelectorAll('div, li, article, section').forEach(element => {
+          if (!(element instanceof HTMLElement) || !isElementVisible(element)) return;
+          if (element === searchRoot) return;
+          if (element.querySelector('textarea')) return;
 
-        const text = getElementText(element);
-        if (!text || text.length > DOM_TUNING.ATTACHMENT_TEXT_MAX_LENGTH) return;
-        if (!ATTACHMENT_NAME_RE.test(text) || !ATTACHMENT_SIZE_RE.test(text)) return;
-
-        const nestedMatch = Array.from(element.children).some(child => {
-          if (!(child instanceof HTMLElement)) return false;
-          const childText = getElementText(child);
-          return Boolean(
-            childText &&
-            childText.length < text.length &&
-            ATTACHMENT_NAME_RE.test(childText) &&
-            ATTACHMENT_SIZE_RE.test(childText)
-          );
+          const text = getElementText(element);
+          if (!text || text.length > DOM_TUNING.ATTACHMENT_TEXT_MAX_LENGTH) return;
+          if (!ATTACHMENT_NAME_RE.test(text) || !ATTACHMENT_SIZE_RE.test(text)) return;
+          if (extractDetectedFileNames([text]).size > 1) return;
+          if (!hasNestedAttachmentLikeChild(element)) set.add(element);
         });
-
-        if (!nestedMatch) set.add(element);
       });
 
       return Array.from(set);
@@ -368,6 +437,7 @@
       controlsCount: controls.length,
       actionButtonsCount: actionButtons.length,
       attachmentsCount: attachments.length,
+      ancestorDistance: getAncestorDistance(textarea, candidate),
       hasTextHint: /深度思考|智能搜索|deepseek|消息|message/.test(text),
       width: rect.width,
       height: rect.height,
@@ -443,7 +513,7 @@
 
         while (node && node !== document.body) {
           const score = scoreComposerRoot(node, textarea);
-          if (score >= bestScore) {
+          if (score > bestScore) {
             bestScore = score;
             best = node;
           }
@@ -700,7 +770,7 @@
     if (ui.placementObserver) return;
 
     ui.placementObserver = new MutationObserver(mutations => {
-      invalidateDomCache();
+      scheduleDomCacheInvalidation();
       const relevant = mutations.some(mutation => !ui.wrapper?.contains(mutation.target));
       if (!relevant) return;
       schedulePlacementSync();
@@ -751,7 +821,7 @@
     };
 
     const observer = new MutationObserver(() => {
-      invalidateDomCache();
+      scheduleDomCacheInvalidation();
       schedule();
     });
 
@@ -812,6 +882,7 @@
       failedAttachments: 0,
       failedNames: [],
       hasServerBusyError: false,
+      hasDuplicateBatchNames: false,
       inputFileCount: getUploadInputFileCount()
     };
     if (!Array.isArray(batchItems) || !batchItems.length || !(root instanceof HTMLElement)) return emptyState;
@@ -836,21 +907,23 @@
     const normalizedBatchNames = batchItems
       .map(item => normalizeSearchText(item?.name))
       .filter(Boolean);
-    const matchedNames = normalizedBatchNames.reduce((count, fileName) => {
+    const uniqueBatchNames = Array.from(new Set(normalizedBatchNames));
+    const matchedNames = uniqueBatchNames.reduce((count, fileName) => {
       if (detectedNames.has(fileName)) return count + 1;
       return combinedText.includes(fileName) ? count + 1 : count;
     }, 0);
+    const hasDuplicateBatchNames = uniqueBatchNames.length !== normalizedBatchNames.length;
 
     const failedNames = new Set();
     let hasServerBusyError = false;
-    const namesToStrip = Array.from(new Set([...normalizedBatchNames, ...detectedNames]));
+    const namesToStrip = Array.from(new Set([...uniqueBatchNames, ...detectedNames]));
     attachmentElements.forEach(element => {
       const text = normalizeSearchText(getElementText(element));
       const statusText = stripKnownFileNames(text, namesToStrip);
       if (!statusText || !ATTACHMENT_ERROR_RE.test(statusText)) return;
       if (ATTACHMENT_SERVER_BUSY_RE.test(statusText)) hasServerBusyError = true;
 
-      const matchedFileName = normalizedBatchNames.find(fileName => text.includes(fileName));
+      const matchedFileName = uniqueBatchNames.find(fileName => text.includes(fileName));
       if (matchedFileName) {
         failedNames.add(matchedFileName);
         return;
@@ -865,6 +938,7 @@
       failedAttachments: failedNames.size,
       failedNames: Array.from(failedNames).filter(name => name !== '__generic__'),
       hasServerBusyError,
+      hasDuplicateBatchNames,
       inputFileCount: getUploadInputFileCount()
     };
   }

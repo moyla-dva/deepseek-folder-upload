@@ -28,6 +28,7 @@
     togglePause,
     clearQueue,
     retryCurrentBatch,
+    retryFailedItemsOnly,
     openFilePicker,
     enableDragDrop,
     enterErrorState,
@@ -56,7 +57,6 @@
         --dfs-amber-soft: #f6e8cd;
         --dfs-danger: #b24545;
         --dfs-danger-soft: #f6dede;
-        --dfs-moss: #517941;
         --dfs-moss-soft: #e1ecd6;
         --dfs-shadow: 0 22px 56px rgba(18, 23, 29, 0.18);
         --dfs-shell-font: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
@@ -614,6 +614,10 @@
         background: linear-gradient(180deg, rgba(249,252,251,0.94), rgba(230,242,239,0.82));
       }
 
+      .dfs-panel-card.tone-log {
+        background: linear-gradient(180deg, rgba(249,248,252,0.94), rgba(235,233,244,0.82));
+      }
+
       .dfs-panel-card.tone-skip {
         background: linear-gradient(180deg, rgba(251,247,241,0.94), rgba(245,236,226,0.82));
       }
@@ -623,6 +627,10 @@
         flex-wrap: wrap;
         gap: 7px;
         margin-top: 10px;
+      }
+
+      .dfs-file-grid.is-compact {
+        margin-top: 8px;
       }
 
       .dfs-file-chip {
@@ -668,6 +676,41 @@
         cursor: pointer;
         color: var(--dfs-accent);
         font-weight: 700;
+      }
+
+      .dfs-log-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .dfs-log-item {
+        padding: 9px 10px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.74);
+        border: 1px solid rgba(31,39,50,0.06);
+      }
+
+      .dfs-log-top {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .dfs-log-title {
+        font-size: 10px;
+        line-height: 1.5;
+        color: var(--dfs-ink);
+        font-weight: 700;
+      }
+
+      .dfs-log-note {
+        margin-top: 7px;
+        font-size: 10px;
+        line-height: 1.52;
+        color: var(--dfs-muted);
       }
 
       .dfs-skip-item {
@@ -949,7 +992,8 @@
       <div class="dfs-drawer-footer">
         <button type="button" class="dfs-btn warn" id="dfs-pause-btn">暂停</button>
         <button type="button" class="dfs-btn danger" id="dfs-clear-btn">清空</button>
-        <button type="button" class="dfs-btn ghost spacer" id="dfs-retry-btn" hidden>重试本批</button>
+        <button type="button" class="dfs-btn ghost" id="dfs-retry-failed-btn" hidden>仅重试失败项</button>
+        <button type="button" class="dfs-btn ghost" id="dfs-retry-btn" hidden>重试本批</button>
         <button type="button" class="dfs-btn primary" id="dfs-continue-btn">继续下一批</button>
       </div>
     `;
@@ -1090,12 +1134,16 @@
       }
       if (event.target.id === 'dfs-pause-btn') togglePause();
       if (event.target.id === 'dfs-clear-btn') await clearQueue();
+      if (event.target.id === 'dfs-retry-failed-btn') await retryFailedItemsOnly();
       if (event.target.id === 'dfs-retry-btn') retryCurrentBatch();
       if (event.target.id === 'dfs-continue-btn' && !isBusyPhase()) {
         if (hasCurrentBatch() && ['awaiting_send', 'paused', 'error'].includes(state.phase)) {
           const attachmentsStillVisible = getComposerAttachmentCount() > state.composerBaselineAttachments;
           if (!state.currentBatchAttachmentsConfirmed && attachmentsStillVisible) {
-            enterErrorState('当前批次附件尚未确认完整。请先检查输入框中的附件；如有残留请先清空，再点击“重试本批”。');
+            enterErrorState('当前批次附件尚未确认完整。请先检查输入框中的附件；如有残留请先清空，再点击“重试本批”。', {
+              errorType: 'attachment_confirm_incomplete',
+              clearFailureContext: false
+            });
             return;
           }
           settleCurrentBatch(true, true);
