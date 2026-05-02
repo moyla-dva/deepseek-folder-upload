@@ -20,6 +20,8 @@
     getCurrentBatchNumber,
     getProgressPercent,
     getKnownComposerAttachmentCount,
+    isFolderReviewPhase,
+    getRemainingFolderReviewMs,
     setRenderSnapshot,
     refreshTotalBatches,
     saveState,
@@ -29,6 +31,10 @@
     renderFileChip,
     isBusyPhase
   } = shared;
+
+  const CURRENT_BATCH_PREVIEW_LIMIT = 6;
+  const QUEUE_PREVIEW_LIMIT = 6;
+  const SESSION_LOG_PREVIEW_LIMIT = 4;
 
   function getComposerAttachmentCount() {
     if (typeof getKnownComposerAttachmentCount === 'function') {
@@ -43,6 +49,77 @@
     if (typeof shared.syncUIPlacement === 'function') {
       shared.syncUIPlacement();
     }
+  }
+
+  function isReviewingFolderSelection() {
+    if (typeof isFolderReviewPhase === 'function') {
+      return isFolderReviewPhase();
+    }
+    return state.phase === 'reviewing' && !hasCurrentBatch();
+  }
+
+  function formatReviewCountdown(ms) {
+    const seconds = Math.max(0, Math.ceil(ms / 1000));
+    return `${seconds} 秒`;
+  }
+
+  function isFullReviewMode() {
+    return isReviewingFolderSelection() && state.reviewMode === 'full';
+  }
+
+  function getReviewQuery() {
+    return String(state.reviewQuery || '').trim().toLowerCase();
+  }
+
+  function getReviewEntries() {
+    const query = getReviewQuery();
+    return state.queue
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => {
+        if (!query) return true;
+        const haystack = `${String(item.path || item.name || '').toLowerCase()}\n${String(item.name || '').toLowerCase()}`;
+        return haystack.includes(query);
+      });
+  }
+
+  function renderFullReviewSection(entries) {
+    const query = state.reviewQuery || '';
+    const filteredCount = entries.length;
+    const deletedCount = Math.max(0, state.removedDuringReviewCount || 0);
+    const rows = filteredCount
+      ? entries.map(({ item, index }) => {
+        const displayPath = String(item.path || item.name || '');
+        const showPath = displayPath && displayPath !== item.name;
+        return `
+          <div class="dfs-review-item">
+            <div class="dfs-review-main">
+              <div class="dfs-review-name">${escapeHtml(item.name)}</div>
+              ${showPath ? `<div class="dfs-review-path">${escapeHtml(displayPath)}</div>` : ''}
+            </div>
+            <button type="button" class="dfs-btn ghost" data-queue-index="${index}">删除</button>
+          </div>
+        `;
+      }).join('')
+      : '<div class="dfs-review-empty">没有匹配到文件。你可以修改搜索词，或返回预览后直接开始上传。</div>';
+
+    return `
+      <section class="dfs-panel-card tone-queue">
+        <div class="dfs-section-head">
+          <div>
+            <div class="dfs-section-kicker">Review All</div>
+            <div class="dfs-section-label">完整检查</div>
+          </div>
+          <div class="dfs-panel-meta">${filteredCount} / ${state.queue.length} 个文件${deletedCount ? ` · 已删除 ${deletedCount}` : ''}</div>
+        </div>
+        <div class="dfs-review-toolbar">
+          <input type="search" id="dfs-review-search" class="dfs-review-search" value="${escapeHtml(query)}" placeholder="搜索文件名或相对路径">
+          <button type="button" class="dfs-btn ghost" id="dfs-review-back-btn">返回预览</button>
+          ${query ? '<button type="button" class="dfs-btn ghost" id="dfs-review-clear-search-btn">清空搜索</button>' : ''}
+        </div>
+        <div class="dfs-setting-help">这里会显示完整待上传列表。删除操作只会影响本轮尚未开始上传的文件。</div>
+        <div class="dfs-review-list">${rows}</div>
+      </section>
+    `;
   }
 
   function updateHeaderChips() {
@@ -115,7 +192,7 @@
 
     const logItems = state.sessionLog.slice(0, 6).map(entry => {
       const meta = getSessionLogStatusMeta(entry.status);
-      const filePreview = (entry.fileNames || []).slice(0, 4);
+      const filePreview = (entry.fileNames || []).slice(0, SESSION_LOG_PREVIEW_LIMIT);
       const extraCount = Math.max(0, (entry.fileCount || 0) - filePreview.length);
       const details = [
         `第 ${entry.batchNumber || '-'} 批`,
@@ -192,43 +269,67 @@
     const pendingFiles = getPendingCount();
     const phaseMeta = getPhaseMeta();
     const queuedItems = getQueuedItemsAfterCurrentBatch();
+    const reviewingFolderSelection = isReviewingFolderSelection();
+    const fullReviewMode = isFullReviewMode();
+    const remainingReviewMs = typeof getRemainingFolderReviewMs === 'function'
+      ? getRemainingFolderReviewMs()
+      : 0;
     const htmlParts = [
       `
         <section class="dfs-progress-card">
-          <div class="dfs-card-kicker">Batch Flow</div>
           <div class="dfs-progress-top">
             <div>
+              <div class="dfs-card-kicker">Batch Flow</div>
               <div class="dfs-progress-count">第 ${currentIndex} / ${totalBatches} 批</div>
-              <div class="dfs-progress-caption">当前工作台会按批次维持同一上下文，自动推进或停在待发送状态。</div>
             </div>
             <span class="dfs-chip ${phaseMeta.chip}">${phaseMeta.text}</span>
           </div>
+          <div class="dfs-progress-caption">保持同一轮对话上下文，按批自动推进；需要你确认时会停在这里。</div>
           <div class="dfs-progress-bar">
             <div class="dfs-progress-fill" style="width:${getProgressPercent()}%"></div>
           </div>
-          <div class="dfs-metric-row">
-            <div class="dfs-metric">
-              <span class="dfs-metric-label">剩余文件</span>
-              <strong class="dfs-metric-value">${pendingFiles}</strong>
-            </div>
-            <div class="dfs-metric">
-              <span class="dfs-metric-label">已完成批次</span>
-              <strong class="dfs-metric-value">${state.completedBatches}</strong>
-            </div>
-            <div class="dfs-metric">
-              <span class="dfs-metric-label">待注入队列</span>
-              <strong class="dfs-metric-value">${queuedItems.length}</strong>
-            </div>
+          <div class="dfs-metric-strip">
+            <span class="dfs-metric-pill"><strong>${pendingFiles}</strong> 剩余文件</span>
+            <span class="dfs-metric-pill"><strong>${state.completedBatches}</strong> 已完成批次</span>
+            <span class="dfs-metric-pill"><strong>${queuedItems.length}</strong> 待注入队列</span>
           </div>
         </section>
       `,
       getNoticeMarkup()
     ];
 
+    if (reviewingFolderSelection && !fullReviewMode) {
+      const reviewAutoStartCopy = remainingReviewMs > 0
+        ? `文件夹已导入完成，${formatReviewCountdown(remainingReviewMs)}后会自动开始上传。若有少数不需要的文件，可先删除再继续。`
+        : '文件夹已导入完成。自动开始已暂停，你可以先删除少数不需要的文件，再手动开始上传。';
+      htmlParts.push(`
+        <section class="dfs-panel-card tone-queue">
+          <div class="dfs-section-head">
+            <div>
+              <div class="dfs-section-kicker">Review</div>
+              <div class="dfs-section-label">导入后检查</div>
+            </div>
+            <div class="dfs-panel-meta">${pendingFiles} 个文件待确认</div>
+          </div>
+          <div class="dfs-setting-help">${reviewAutoStartCopy}</div>
+          <div class="dfs-empty-actions">
+            <button type="button" class="dfs-btn primary" id="dfs-review-start-btn">立即开始上传</button>
+            <button type="button" class="dfs-btn ghost" id="dfs-review-inspect-btn">继续检查</button>
+          </div>
+        </section>
+      `);
+    }
+
+    if (fullReviewMode) {
+      htmlParts.push(renderFullReviewSection(getReviewEntries()));
+    }
+
     if (hasCurrentBatch()) {
       const attachmentSummary = state.currentBatchExpectedAttachments
         ? `${state.currentBatchDetectedAttachments || 0} / ${state.currentBatchExpectedAttachments} 附件确认`
         : `${state.currentBatch.length} 个文件`;
+      const currentBatchPreview = state.currentBatch.slice(0, CURRENT_BATCH_PREVIEW_LIMIT);
+      const currentBatchOverflow = Math.max(0, state.currentBatch.length - currentBatchPreview.length);
 
       htmlParts.push(`
         <section class="dfs-panel-card tone-current">
@@ -240,16 +341,16 @@
             <div class="dfs-panel-meta">${attachmentSummary}</div>
           </div>
           <div class="dfs-file-grid">
-            ${state.currentBatch.slice(0, state.config.batchSize).map(item => renderFileChip(item)).join('')}
-            ${state.currentBatch.length > state.config.batchSize ? `<span class="dfs-file-chip dfs-file-chip-more">+${state.currentBatch.length - state.config.batchSize} 个…</span>` : ''}
+            ${currentBatchPreview.map(item => renderFileChip(item)).join('')}
+            ${currentBatchOverflow ? `<span class="dfs-file-chip dfs-file-chip-more">+${currentBatchOverflow} 个…</span>` : ''}
           </div>
         </section>
       `);
     }
 
-    if (queuedItems.length) {
+    if (queuedItems.length && !fullReviewMode) {
       const queueOffset = queueStartsWithCurrentBatch() ? state.currentBatch.length : 0;
-      const preview = queuedItems.slice(0, Math.min(queuedItems.length, 8));
+      const preview = queuedItems.slice(0, Math.min(queuedItems.length, QUEUE_PREVIEW_LIMIT));
       htmlParts.push(`
         <section class="dfs-panel-card tone-queue">
           <div class="dfs-section-head">
@@ -464,7 +565,7 @@
 
     if (pauseBtn) {
       pauseBtn.textContent = state.isPaused ? '恢复流程' : '暂停';
-      pauseBtn.disabled = !hasPendingWork() && state.phase !== 'paused';
+      pauseBtn.disabled = isReviewingFolderSelection() || (!hasPendingWork() && state.phase !== 'paused');
     }
 
     const canRetryFailedOnly = hasCurrentBatch() &&
@@ -485,7 +586,9 @@
     }
 
     if (continueBtn) {
-      if (hasCurrentBatch() && ['awaiting_send', 'paused', 'error'].includes(state.phase)) {
+      if (isReviewingFolderSelection() && state.queue.length) {
+        continueBtn.textContent = '开始上传';
+      } else if (hasCurrentBatch() && ['awaiting_send', 'paused', 'error'].includes(state.phase)) {
         continueBtn.textContent = canAssumeSent ? '标记已发' : '先检查附件';
       } else if (state.queue.length) {
         continueBtn.textContent = '继续下一批';
@@ -574,6 +677,7 @@
     if (!ui.drawer) return;
     syncUIPlacement();
     clearTimeout(ui.drawerHideTimerId);
+    ui.wrapper?.classList.add('drawer-open');
     ui.drawer.style.display = 'flex';
     requestAnimationFrame(() => ui.drawer.classList.add('is-open'));
     setActiveTab(tabName);
@@ -583,6 +687,7 @@
 
   function hideDrawer() {
     if (!ui.drawer) return;
+    ui.wrapper?.classList.remove('drawer-open');
     ui.drawer.classList.remove('is-open');
     clearTimeout(ui.drawerHideTimerId);
     ui.drawerHideTimerId = setTimeout(() => {

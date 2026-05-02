@@ -25,6 +25,8 @@
     schedulePlacementSync,
     registerManualSendAttempt,
     startNextBatch,
+    syncSessionToConversationRoute,
+    pauseFolderReviewAutoStart,
     togglePause,
     clearQueue,
     retryCurrentBatch,
@@ -34,6 +36,9 @@
     enterErrorState,
     settleCurrentBatch
   } = shared;
+
+  const DFS_ROUTE_CHANGE_EVENT = 'dfs:route-change';
+  let conversationRouteWatcherInstalled = false;
 
   function injectStyles() {
     if (document.getElementById('dfs-redesign-style')) return;
@@ -136,6 +141,12 @@
 
       #dfs-uploader-root.is-anchored .dfs-upload-btn::before {
         border-radius: 10px;
+      }
+
+      #dfs-uploader-root.drawer-open .dfs-upload-btn {
+        opacity: 0;
+        transform: translateX(10px);
+        pointer-events: none;
       }
 
       .dfs-upload-btn.is-injecting {
@@ -284,25 +295,30 @@
       }
 
       .dfs-drawer {
-        width: min(336px, calc(100vw - 24px));
-        max-height: 418px;
+        width: min(368px, calc(100vw - 24px));
+        height: auto;
+        max-height: none;
         display: none;
         flex-direction: column;
         overflow: hidden;
-        position: absolute;
-        bottom: calc(100% + 10px);
-        left: 0;
-        border-radius: 18px;
+        position: fixed;
+        top: 16px;
+        right: 16px;
+        bottom: 16px;
+        left: auto;
+        border-radius: 24px;
         background:
-          radial-gradient(circle at top left, rgba(203, 94, 61, 0.1), transparent 32%),
-          radial-gradient(circle at top right, rgba(31, 118, 105, 0.08), transparent 28%),
-          linear-gradient(180deg, rgba(255,255,255,0.92), rgba(255,250,242,0.92));
+          radial-gradient(circle at top left, rgba(203, 94, 61, 0.12), transparent 34%),
+          radial-gradient(circle at top right, rgba(31, 118, 105, 0.09), transparent 28%),
+          linear-gradient(180deg, rgba(255,255,255,0.96), rgba(255,250,242,0.94));
         border: 1px solid rgba(31, 39, 50, 0.08);
-        box-shadow: var(--dfs-shadow);
-        backdrop-filter: blur(18px);
+        box-shadow:
+          0 24px 64px rgba(18, 23, 29, 0.2),
+          -10px 0 24px rgba(18, 23, 29, 0.06);
+        backdrop-filter: blur(20px);
         opacity: 0;
-        transform: translateY(12px) scale(0.985);
-        transform-origin: bottom right;
+        transform: translateX(16px);
+        transform-origin: right center;
         transition: opacity 0.18s ease, transform 0.18s ease;
       }
 
@@ -318,13 +334,7 @@
 
       .dfs-drawer.is-open {
         opacity: 1;
-        transform: translateY(0) scale(1);
-      }
-
-      #dfs-uploader-root.is-floating .dfs-drawer,
-      #dfs-uploader-root.drawer-right .dfs-drawer {
-        left: auto;
-        right: 0;
+        transform: translateX(0);
       }
 
       .dfs-drawer-header,
@@ -336,19 +346,27 @@
       }
 
       .dfs-drawer-header {
-        padding: 11px 13px 10px;
+        padding: 14px 15px 12px;
         display: flex;
         align-items: flex-start;
         justify-content: space-between;
         border-bottom: 1px solid rgba(31, 39, 50, 0.06);
-        gap: 11px;
+        gap: 12px;
       }
 
       .dfs-header-copy {
         display: flex;
         flex-direction: column;
-        gap: 3px;
+        gap: 4px;
         min-width: 0;
+      }
+
+      .dfs-header-actions {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 8px;
+        flex: none;
       }
 
       .dfs-drawer-eyebrow {
@@ -361,21 +379,22 @@
 
       .dfs-drawer-title {
         font-family: var(--dfs-display-font);
-        font-size: 18px;
-        line-height: 1.05;
+        font-size: 17px;
+        line-height: 1.08;
         color: var(--dfs-ink);
         font-weight: 600;
       }
 
       .dfs-drawer-subtitle {
-        font-size: 10px;
-        line-height: 1.45;
+        max-width: 220px;
+        font-size: 11px;
+        line-height: 1.48;
         color: var(--dfs-muted);
       }
 
       .dfs-chip-row {
         display: flex;
-        gap: 5px;
+        gap: 6px;
         flex-wrap: wrap;
         justify-content: flex-end;
       }
@@ -386,7 +405,7 @@
         gap: 5px;
         font-size: 10px;
         line-height: 1;
-        padding: 6px 9px;
+        padding: 6px 10px;
         border-radius: 999px;
         font-weight: 700;
         letter-spacing: 0.01em;
@@ -410,11 +429,35 @@
       .dfs-chip.gray { background: #ece6dc; color: #5f5647; border-color: rgba(95,86,71,0.1); }
       .dfs-chip.green { background: var(--dfs-moss-soft); color: #446337; border-color: rgba(81,121,65,0.12); }
 
+      .dfs-drawer-close {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        min-height: 30px;
+        padding: 0 12px;
+        border-radius: 999px;
+        border: 1px solid rgba(31, 39, 50, 0.08);
+        background: rgba(255,255,255,0.72);
+        color: var(--dfs-muted);
+        font-size: 10px;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 0.16s ease, border-color 0.16s ease, color 0.16s ease, background 0.16s ease;
+      }
+
+      .dfs-drawer-close:hover {
+        transform: translateY(-1px);
+        border-color: rgba(203, 94, 61, 0.18);
+        color: var(--dfs-accent-deep);
+        background: rgba(255,255,255,0.86);
+      }
+
       .dfs-drawer-tabs {
         display: grid;
         grid-template-columns: repeat(3, 1fr);
         gap: 5px;
-        padding: 8px 13px 0;
+        padding: 10px 15px 0;
       }
 
       .dfs-drawer-tab {
@@ -448,12 +491,13 @@
       }
 
       .dfs-drawer-body {
-        padding: 11px 13px 10px;
+        flex: 1;
+        min-height: 0;
+        padding: 12px 15px 14px;
         overflow: auto;
-        min-height: 164px;
         display: flex;
         flex-direction: column;
-        gap: 10px;
+        gap: 12px;
       }
 
       .dfs-progress-card,
@@ -469,7 +513,7 @@
       .dfs-progress-card,
       .dfs-panel-card,
       .dfs-settings-card {
-        padding: 11px;
+        padding: 12px;
       }
 
       .dfs-hero-card {
@@ -527,7 +571,7 @@
 
       .dfs-progress-count {
         font-family: var(--dfs-display-font);
-        font-size: 20px;
+        font-size: 21px;
         line-height: 1;
         color: var(--dfs-ink);
       }
@@ -542,7 +586,7 @@
       }
 
       .dfs-progress-bar {
-        margin-top: 11px;
+        margin-top: 10px;
         height: 7px;
         border-radius: 999px;
         background: rgba(31,39,50,0.08);
@@ -556,33 +600,30 @@
         box-shadow: 0 0 12px rgba(203, 94, 61, 0.18);
       }
 
-      .dfs-metric-row {
-        display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
-        gap: 8px;
-        margin-top: 11px;
+      .dfs-metric-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+        margin-top: 10px;
       }
 
-      .dfs-metric {
-        padding: 8px 8px 7px;
-        border-radius: 12px;
-        background: rgba(255,255,255,0.74);
+      .dfs-metric-pill {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 5px;
+        padding: 6px 9px;
+        border-radius: 999px;
+        background: rgba(255,255,255,0.78);
         border: 1px solid rgba(31,39,50,0.06);
+        color: var(--dfs-muted);
+        font-size: 10px;
+        line-height: 1.2;
       }
 
-      .dfs-metric-label {
-        display: block;
-        font-size: 9px;
-        letter-spacing: 0.08em;
-        text-transform: uppercase;
-        color: var(--dfs-faint);
-        margin-bottom: 4px;
-      }
-
-      .dfs-metric-value {
-        font-size: 15px;
-        line-height: 1;
+      .dfs-metric-pill strong {
         color: var(--dfs-ink);
+        font-size: 13px;
+        line-height: 1;
       }
 
       .dfs-notice {
@@ -626,7 +667,7 @@
         display: flex;
         flex-wrap: wrap;
         gap: 7px;
-        margin-top: 10px;
+        margin-top: 9px;
       }
 
       .dfs-file-grid.is-compact {
@@ -653,7 +694,7 @@
       }
 
       .dfs-file-name {
-        max-width: 160px;
+        max-width: 144px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -725,6 +766,87 @@
 
       .dfs-skip-item:last-child { border-bottom: 0; }
       .dfs-skip-name { color: var(--dfs-ink); }
+
+      .dfs-review-toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .dfs-review-search {
+        flex: 1 1 180px;
+        min-width: 0;
+        font-size: 11px;
+        color: var(--dfs-ink);
+        border: 1px solid rgba(31,39,50,0.1);
+        border-radius: 11px;
+        padding: 9px 11px;
+        background: rgba(255,255,255,0.9);
+        box-sizing: border-box;
+        transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+        font-family: var(--dfs-shell-font);
+      }
+
+      .dfs-review-search:focus {
+        outline: none;
+        border-color: rgba(203,94,61,0.4);
+        box-shadow: 0 0 0 4px rgba(203,94,61,0.1);
+        background: rgba(255,255,255,0.98);
+      }
+
+      .dfs-review-list {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        margin-top: 12px;
+        max-height: min(44vh, 420px);
+        overflow: auto;
+        padding-right: 2px;
+      }
+
+      .dfs-review-item {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 11px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.74);
+        border: 1px solid rgba(31,39,50,0.06);
+      }
+
+      .dfs-review-main {
+        min-width: 0;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .dfs-review-name {
+        font-size: 11px;
+        line-height: 1.35;
+        font-weight: 700;
+        color: var(--dfs-ink);
+        word-break: break-word;
+      }
+
+      .dfs-review-path {
+        font-size: 10px;
+        line-height: 1.45;
+        color: var(--dfs-muted);
+        word-break: break-word;
+      }
+
+      .dfs-review-empty {
+        padding: 12px;
+        border-radius: 12px;
+        background: rgba(255,255,255,0.66);
+        border: 1px dashed rgba(31,39,50,0.1);
+        font-size: 10px;
+        line-height: 1.55;
+        color: var(--dfs-muted);
+      }
 
       .dfs-settings-card + .dfs-settings-card,
       .dfs-panel-card + .dfs-panel-card,
@@ -813,10 +935,15 @@
       .dfs-drawer-footer {
         display: flex;
         align-items: center;
+        flex-wrap: wrap;
         gap: 6px;
-        padding: 10px 13px 11px;
+        padding: 12px 15px 14px;
         border-top: 1px solid rgba(31, 39, 50, 0.06);
         background: linear-gradient(180deg, rgba(255,255,255,0.22), rgba(255,249,240,0.72));
+      }
+
+      #dfs-continue-btn {
+        margin-left: auto;
       }
 
       .dfs-btn {
@@ -935,11 +1062,12 @@
       @media (max-width: 560px) {
         #dfs-uploader-root.is-floating { right: 12px; bottom: 96px; }
         .dfs-drawer {
-          width: min(92vw, 336px);
-          max-height: min(76vh, 418px);
-        }
-        .dfs-metric-row {
-          grid-template-columns: repeat(2, minmax(0, 1fr));
+          width: auto;
+          top: 12px;
+          right: 12px;
+          bottom: 12px;
+          left: 12px;
+          border-radius: 20px;
         }
         .dfs-setting-row {
           flex-direction: column;
@@ -947,6 +1075,12 @@
         }
         .dfs-setting-row label {
           width: auto;
+        }
+        .dfs-header-actions {
+          gap: 6px;
+        }
+        .dfs-drawer-subtitle {
+          max-width: none;
         }
       }
     `;
@@ -976,11 +1110,14 @@
         <div class="dfs-header-copy">
           <span class="dfs-drawer-eyebrow">DeepSeek Uploader</span>
           <span class="dfs-drawer-title">批量上传工作台</span>
-          <span class="dfs-drawer-subtitle">把多批资料稳定送进同一轮对话上下文，并在需要时停留给你确认。</span>
+          <span class="dfs-drawer-subtitle">把多批资料稳稳送进同一轮对话上下文，需要你确认时会停在这里。</span>
         </div>
-        <div class="dfs-chip-row">
-          <span id="dfs-source-chip" class="dfs-chip sand"></span>
-          <span id="dfs-mode-chip" class="dfs-chip teal"></span>
+        <div class="dfs-header-actions">
+          <div class="dfs-chip-row">
+            <span id="dfs-source-chip" class="dfs-chip sand"></span>
+            <span id="dfs-mode-chip" class="dfs-chip teal"></span>
+          </div>
+          <button type="button" class="dfs-drawer-close" id="dfs-close-btn" aria-label="收起工作台">收起</button>
         </div>
       </div>
       <div class="dfs-drawer-tabs">
@@ -1054,6 +1191,51 @@
     });
   }
 
+  function installConversationRouteWatcher() {
+    if (conversationRouteWatcherInstalled) return;
+    conversationRouteWatcherInstalled = true;
+
+    const scheduleRouteSync = () => {
+      requestAnimationFrame(() => {
+        syncSessionToConversationRoute?.();
+      });
+    };
+
+    window.addEventListener('popstate', scheduleRouteSync);
+    window.addEventListener('hashchange', scheduleRouteSync);
+    window.addEventListener(DFS_ROUTE_CHANGE_EVENT, scheduleRouteSync);
+
+    if (!window.__dfsHistoryRoutePatched && window.history) {
+      const originalPushState = typeof window.history.pushState === 'function'
+        ? window.history.pushState.bind(window.history)
+        : null;
+      const originalReplaceState = typeof window.history.replaceState === 'function'
+        ? window.history.replaceState.bind(window.history)
+        : null;
+      const dispatchRouteChange = () => window.dispatchEvent(new Event(DFS_ROUTE_CHANGE_EVENT));
+
+      if (originalPushState) {
+        window.history.pushState = function patchedPushState(...args) {
+          const result = originalPushState(...args);
+          dispatchRouteChange();
+          return result;
+        };
+      }
+
+      if (originalReplaceState) {
+        window.history.replaceState = function patchedReplaceState(...args) {
+          const result = originalReplaceState(...args);
+          dispatchRouteChange();
+          return result;
+        };
+      }
+
+      window.__dfsHistoryRoutePatched = true;
+    }
+
+    scheduleRouteSync();
+  }
+
   function mountUI() {
     if (document.getElementById('dfs-uploader-root')) return;
 
@@ -1090,6 +1272,10 @@
         openFilePicker(state.uploadSource);
         return;
       }
+      if (ui.drawer?.classList.contains('is-open')) {
+        hideDrawer();
+        return;
+      }
       showDrawer('queue');
     });
 
@@ -1097,6 +1283,10 @@
       const tab = event.target.closest('.dfs-drawer-tab');
       if (tab) {
         setActiveTab(tab.dataset.tab);
+        return;
+      }
+      if (event.target.id === 'dfs-close-btn') {
+        hideDrawer();
         return;
       }
       if (event.target.id === 'dfs-pick-folder-btn') {
@@ -1107,11 +1297,49 @@
         openFilePicker('files');
         return;
       }
+      if (event.target.id === 'dfs-review-start-btn') {
+        await startNextBatch(state.uploadMode);
+        return;
+      }
+      if (event.target.id === 'dfs-review-inspect-btn') {
+        pauseFolderReviewAutoStart?.();
+        state.reviewMode = 'full';
+        updateAll();
+        requestAnimationFrame(() => {
+          const input = ui.drawer?.querySelector('#dfs-review-search');
+          input?.focus();
+        });
+        return;
+      }
+      if (event.target.id === 'dfs-review-back-btn') {
+        state.reviewMode = 'preview';
+        updateAll();
+        return;
+      }
+      if (event.target.id === 'dfs-review-clear-search-btn') {
+        state.reviewQuery = '';
+        updateAll();
+        requestAnimationFrame(() => {
+          const input = ui.drawer?.querySelector('#dfs-review-search');
+          input?.focus();
+        });
+        return;
+      }
       const queueRemove = event.target.closest('[data-queue-index]');
       if (queueRemove) {
         const index = Number(queueRemove.dataset.queueIndex);
         if (Number.isInteger(index)) {
           state.queue.splice(index, 1);
+          if (state.phase === 'reviewing') {
+            pauseFolderReviewAutoStart?.();
+            state.removedDuringReviewCount = Math.max(0, (state.removedDuringReviewCount || 0) + 1);
+            if (!state.queue.length) {
+              state.phase = 'idle';
+              state.folderReviewPending = false;
+              state.reviewMode = 'preview';
+              state.reviewQuery = '';
+            }
+          }
           refreshTotalBatches();
           saveState();
           updateAll();
@@ -1156,6 +1384,19 @@
       }
     });
 
+    ui.drawer.addEventListener('input', event => {
+      if (event.target.id !== 'dfs-review-search') return;
+      state.reviewQuery = event.target.value;
+      const cursorAt = event.target.selectionStart ?? String(event.target.value || '').length;
+      updateAll();
+      requestAnimationFrame(() => {
+        const input = ui.drawer?.querySelector('#dfs-review-search');
+        if (!input) return;
+        input.focus();
+        input.setSelectionRange(cursorAt, cursorAt);
+      });
+    });
+
     document.addEventListener('click', event => {
       const sendBtn = event.target.closest('button, [role="button"], input[type="submit"]');
       if (!sendBtn) return;
@@ -1180,10 +1421,15 @@
     }, true);
 
     document.addEventListener('click', event => {
-      if (!ui.wrapper.contains(event.target)) hideDrawer();
+      const path = typeof event.composedPath === 'function' ? event.composedPath() : null;
+      const clickedInsideWrapper = Array.isArray(path)
+        ? path.includes(ui.wrapper)
+        : ui.wrapper.contains(event.target);
+      if (!clickedInsideWrapper) hideDrawer();
     });
 
     enableDragDrop();
+    installConversationRouteWatcher();
     observePlacement();
     schedulePlacementSync(0);
     updateAll();

@@ -22,6 +22,11 @@ function loadWorkflowHelpers() {
       setItem() {},
       removeItem() {}
     },
+    location: {
+      pathname: '/',
+      search: '',
+      hash: ''
+    },
     document: {
       body: {},
       querySelectorAll() { return []; },
@@ -53,6 +58,7 @@ function loadWorkflowHelpers() {
   shared.isAssistantResponding = () => false;
   shared.observeComposerSignals = () => () => {};
   shared.getComposerAttachmentCount = () => shared.__composerAttachmentCount || 0;
+  shared.getComposerAttachmentNameCounts = () => new Map(shared.__composerAttachmentNameCounts || []);
   shared.inspectBatchAttachmentState = () => ({
     matchedNames: 0,
     visibleAttachments: 0,
@@ -63,6 +69,8 @@ function loadWorkflowHelpers() {
     inputFileCount: 0
   });
   shared.hasAttachmentErrorIndicators = () => false;
+  shared.isFreshConversationLandingPage = () => Boolean(shared.__landingPage);
+  shared.__testLocation = context.location;
 
   const workflowSource = fs.readFileSync(path.join(ROOT_DIR, 'dfs-workflow.js'), 'utf8');
   vm.runInContext(workflowSource, context, { filename: 'dfs-workflow.js' });
@@ -100,6 +108,21 @@ test('existing composer attachments reduce the next injectable batch size', () =
   assert.equal(shared.getInjectableBatchSize(50), 0);
 });
 
+test('classifyFiles preserves relative folder paths for later review filtering', () => {
+  const shared = loadWorkflowHelpers();
+
+  const { queue } = shared.classifyFiles([
+    {
+      name: 'report.md',
+      webkitRelativePath: 'notes/week-1/report.md',
+      size: 42,
+      type: 'text/markdown'
+    }
+  ]);
+
+  assert.equal(queue[0].path, 'notes/week-1/report.md');
+});
+
 test('projected total batches account for a smaller first injection when the composer already has attachments', () => {
   const shared = loadWorkflowHelpers();
   const queue = Array.from({ length: 100 }, (_, index) => ({ name: `file-${index}.txt` }));
@@ -114,6 +137,115 @@ test('projected total batches account for a smaller first injection when the com
   shared.state.currentBatch = queue.slice(0, 38);
   shared.refreshTotalBatches();
   assert.equal(shared.state.totalBatches, 3);
+});
+
+test('current batch planning counts unique composer attachments toward the logical batch even when they appear near the tail of the queue', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.config.batchSize = 50;
+  shared.state.queue = Array.from({ length: 51 }, (_, index) => ({
+    name: `file-${String(index + 1).padStart(2, '0')}.txt`
+  }));
+  shared.__composerAttachmentCount = 3;
+  shared.__composerAttachmentNameCounts = [
+    ['file-49.txt', 1],
+    ['file-50.txt', 1],
+    ['file-51.txt', 1]
+  ];
+
+  const plan = helpers.buildCurrentBatchSelectionPlan({
+    existingAttachmentCount: shared.__composerAttachmentCount
+  });
+
+  assert.equal(plan.batchItems.length, 50);
+  assert.equal(plan.preloadedItems.length, 3);
+  assert.equal(plan.injectItems.length, 47);
+  assert.equal(plan.preloadedItems.map(item => item.name).join(','), 'file-49.txt,file-50.txt,file-51.txt');
+  assert.equal(plan.batchItems.some(item => item.name === 'file-48.txt'), false);
+  assert.equal(plan.batchItems[plan.batchItems.length - 1].name, 'file-51.txt');
+});
+
+test('current batch planning does not treat duplicate queue names as already covered by composer attachments', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.config.batchSize = 50;
+  shared.state.queue = [
+    { name: 'dup.txt' },
+    { name: 'dup.txt' },
+    { name: 'other.txt' }
+  ];
+  shared.__composerAttachmentCount = 1;
+  shared.__composerAttachmentNameCounts = [
+    ['dup.txt', 1]
+  ];
+
+  const plan = helpers.buildCurrentBatchSelectionPlan({
+    existingAttachmentCount: shared.__composerAttachmentCount
+  });
+
+  assert.equal(plan.preloadedItems.length, 0);
+  assert.equal(plan.injectItems.length, 3);
+  assert.equal(plan.batchItems.length, 3);
+});
+
+test('folder review arms a delayed auto-start window before uploading begins', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.uploadSource = 'folder';
+  shared.state.folderReviewPending = true;
+  shared.state.queue = [
+    { name: 'alpha.txt' },
+    { name: 'beta.txt' }
+  ];
+
+  const armed = helpers.beginFolderReview({ autoStartMs: 5000 });
+
+  assert.equal(armed, true);
+  assert.equal(shared.state.phase, 'reviewing');
+  assert.ok(shared.state.reviewAutoStartAt > Date.now());
+
+  helpers.pauseFolderReviewAutoStart();
+  assert.equal(shared.state.reviewAutoStartAt, 0);
+});
+
+test('folder review does not re-arm once the first batch has already begun', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.uploadSource = 'folder';
+  shared.state.folderReviewPending = true;
+  shared.state.completedBatches = 1;
+  shared.state.queue = [
+    { name: 'tail.txt' }
+  ];
+
+  const armed = helpers.beginFolderReview({ autoStartMs: 5000 });
+
+  assert.equal(armed, false);
+  assert.notEqual(shared.state.phase, 'reviewing');
+});
+
+test('completing folder review clears review mode and query state', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.phase = 'reviewing';
+  shared.state.folderReviewPending = true;
+  shared.state.reviewMode = 'full';
+  shared.state.reviewQuery = 'draft';
+  shared.state.removedDuringReviewCount = 3;
+  shared.state.queue = [{ name: 'keep.txt' }];
+
+  helpers.completeFolderReview();
+
+  assert.equal(shared.state.folderReviewPending, false);
+  assert.equal(shared.state.reviewMode, 'preview');
+  assert.equal(shared.state.reviewQuery, '');
+  assert.equal(shared.state.removedDuringReviewCount, 0);
+  assert.equal(shared.state.phase, 'queued');
 });
 
 test('render snapshot reuses composer attachment count across queue summary calculations', () => {
@@ -134,6 +266,84 @@ test('render snapshot reuses composer attachment count across queue summary calc
   assert.equal(reads, 0);
   assert.equal(shared.state.totalBatches, 2);
   assert.match(noticeMarkup, /自动缩到 38 个文件/);
+});
+
+test('folder selection enters review mode before the first batch starts', async () => {
+  const shared = loadWorkflowHelpers();
+
+  await shared.handleSelectedFiles([
+    { name: 'keep-a.txt', size: 10, type: 'text/plain' },
+    { name: 'keep-b.txt', size: 20, type: 'text/plain' }
+  ], 'folder');
+
+  assert.equal(shared.state.phase, 'reviewing');
+  assert.equal(shared.state.currentBatch.length, 0);
+  assert.equal(shared.state.queue.length, 2);
+  assert.equal(shared.state.reviewMode, 'preview');
+  assert.ok(shared.state.reviewAutoStartAt > Date.now());
+
+  shared.clearAllTimers();
+});
+
+test('route sync treats the first post-send route change as normal conversation materialization', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.queue = [{ name: 'tail.txt' }];
+  shared.state.currentBatch = [{ name: 'alpha.txt' }];
+  shared.state.phase = 'sending';
+  shared.state.sessionRouteOriginKey = '/';
+  shared.__testLocation.pathname = '/chat/abc123';
+
+  const reset = helpers.syncSessionToConversationRoute();
+
+  assert.equal(reset, false);
+  assert.equal(shared.state.sessionRouteOriginKey, '/');
+  assert.equal(shared.state.sessionEstablishedRouteKey, '/chat/abc123');
+  assert.equal(shared.state.currentBatch.length, 1);
+});
+
+test('route sync clears pending plugin state after the active conversation route is deleted or changed away', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.queue = [{ name: 'tail.txt' }];
+  shared.state.currentBatch = [{ name: 'alpha.txt' }];
+  shared.state.phase = 'awaiting_send';
+  shared.state.sessionRouteOriginKey = '/';
+  shared.state.sessionEstablishedRouteKey = '/chat/abc123';
+  shared.__testLocation.pathname = '/';
+
+  const reset = helpers.syncSessionToConversationRoute();
+
+  assert.equal(reset, true);
+  assert.equal(shared.state.phase, 'idle');
+  assert.equal(shared.state.queue.length, 0);
+  assert.equal(shared.state.currentBatch.length, 0);
+  assert.equal(shared.state.sessionRouteOriginKey, '/');
+  assert.equal(shared.state.sessionEstablishedRouteKey, '');
+});
+
+test('route sync clears pending plugin state when the page falls back to the empty landing view on the same route', () => {
+  const shared = loadWorkflowHelpers();
+  const helpers = shared.__dfsWorkflowHelpers;
+
+  shared.state.queue = [{ name: 'tail.txt' }];
+  shared.state.currentBatch = [{ name: 'alpha.txt' }];
+  shared.state.phase = 'awaiting_send';
+  shared.state.sessionRouteOriginKey = '/chat/abc123';
+  shared.state.sessionEstablishedRouteKey = '/chat/abc123';
+  shared.__testLocation.pathname = '/chat/abc123';
+  shared.__landingPage = true;
+
+  const reset = helpers.syncSessionToConversationRoute();
+
+  assert.equal(reset, true);
+  assert.equal(shared.state.phase, 'idle');
+  assert.equal(shared.state.queue.length, 0);
+  assert.equal(shared.state.currentBatch.length, 0);
+  assert.equal(shared.state.sessionRouteOriginKey, '/chat/abc123');
+  assert.equal(shared.state.sessionEstablishedRouteKey, '');
 });
 
 test('session log tracks batch lifecycle from injection to completion', () => {

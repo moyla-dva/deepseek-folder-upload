@@ -7,6 +7,7 @@
   const {
     MAX_FILES_PER_BATCH,
     DEFAULT_BATCH_INTERVAL_SECONDS,
+    FOLDER_REVIEW_AUTOSTART_MS,
     ATTACHMENT_TIMEOUT_MIN_MS,
     ATTACHMENT_TIMEOUT_MAX_MS,
     ATTACHMENT_POLL_MS,
@@ -55,8 +56,10 @@
     isAssistantResponding,
     observeComposerSignals,
     getComposerAttachmentCount,
+    getComposerAttachmentNameCounts,
     inspectBatchAttachmentState,
-    hasAttachmentErrorIndicators
+    hasAttachmentErrorIndicators,
+    isFreshConversationLandingPage
   } = shared;
 
   const TRANSIENT_RETRY_DELAYS_MS = [1000, 2000, 4000];
@@ -66,6 +69,102 @@
   const SERVER_BUSY_SHRINK_THRESHOLD = 2;
   const SUCCESSFUL_BATCHES_TO_RESTORE = 2;
   const SESSION_LOG_LIMIT = 20;
+
+  function shouldUseFolderReview() {
+    return Boolean(
+      state.folderReviewPending &&
+      state.uploadSource === 'folder' &&
+      state.completedBatches === 0 &&
+      !hasCurrentBatch() &&
+      state.queue.length
+    );
+  }
+
+  function isFolderReviewPhase() {
+    return state.phase === 'reviewing' && shouldUseFolderReview();
+  }
+
+  function getRemainingFolderReviewMs() {
+    return Math.max(0, (state.reviewAutoStartAt || 0) - Date.now());
+  }
+
+  function pauseFolderReviewAutoStart() {
+    if (state.reviewTimerId) {
+      clearTimeout(state.reviewTimerId);
+      state.reviewTimerId = null;
+    }
+    if (state.reviewTickerId) {
+      clearInterval(state.reviewTickerId);
+      state.reviewTickerId = null;
+    }
+    state.reviewAutoStartAt = 0;
+  }
+
+  function completeFolderReview() {
+    pauseFolderReviewAutoStart();
+    state.folderReviewPending = false;
+    state.reviewMode = 'preview';
+    state.reviewQuery = '';
+    state.removedDuringReviewCount = 0;
+    if (state.phase === 'reviewing') {
+      state.phase = state.queue.length ? 'queued' : 'idle';
+    }
+  }
+
+  function beginFolderReview(options = {}) {
+    pauseFolderReviewAutoStart();
+    if (!shouldUseFolderReview()) {
+      if (!state.queue.length) {
+        state.phase = 'idle';
+      }
+      return false;
+    }
+    if (!state.queue.length) {
+      state.phase = 'idle';
+      return false;
+    }
+
+    const autoStartMs = Math.max(0, Number.isFinite(options.autoStartMs) ? options.autoStartMs : FOLDER_REVIEW_AUTOSTART_MS);
+    state.phase = 'reviewing';
+    state.errorMessage = '';
+    state.reviewMode = 'preview';
+    state.reviewQuery = '';
+
+    if (autoStartMs <= 0) {
+      state.reviewAutoStartAt = 0;
+      return true;
+    }
+
+    state.reviewAutoStartAt = Date.now() + autoStartMs;
+    state.reviewTickerId = setInterval(() => {
+      if (!isFolderReviewPhase() || !state.reviewAutoStartAt) {
+        pauseFolderReviewAutoStart();
+        return;
+      }
+      if (getRemainingFolderReviewMs() <= 0) {
+        if (state.reviewTickerId) {
+          clearInterval(state.reviewTickerId);
+          state.reviewTickerId = null;
+        }
+        return;
+      }
+      updateAll();
+    }, 1000);
+    state.reviewTimerId = setTimeout(() => {
+      state.reviewTimerId = null;
+      if (state.reviewTickerId) {
+        clearInterval(state.reviewTickerId);
+        state.reviewTickerId = null;
+      }
+      if (!isFolderReviewPhase() || state.isPaused || !state.queue.length) {
+        state.reviewAutoStartAt = 0;
+        return;
+      }
+      state.reviewAutoStartAt = 0;
+      startNextBatchSafely(state.uploadMode);
+    }, autoStartMs);
+    return true;
+  }
 
   function setNativeValue(element, value) {
     const proto = Object.getPrototypeOf(element);
@@ -83,6 +182,15 @@
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function getCurrentConversationRouteKey() {
+    const locationObject = window.location;
+    if (!locationObject) return '';
+    const pathname = String(locationObject.pathname || '');
+    const search = String(locationObject.search || '');
+    const hash = String(locationObject.hash || '');
+    return `${pathname}${search}${hash}`;
   }
 
   function getBaseBatchCooldownMs() {
@@ -238,6 +346,83 @@
     return fileNames.length !== new Set(fileNames).size;
   }
 
+  function getNormalizedQueueItemName(item) {
+    return String(item?.name || '').trim().toLowerCase();
+  }
+
+  function buildCurrentBatchSelectionPlan(options = {}) {
+    const queueItems = Array.isArray(options.queueItems) ? options.queueItems : state.queue;
+    const existingAttachmentCount = Number.isFinite(Number(options.existingAttachmentCount))
+      ? Number(options.existingAttachmentCount)
+      : getComposerAttachmentCount();
+    const batchSize = Math.min(MAX_FILES_PER_BATCH, Math.max(1, parseInt(options.batchSize, 10) || getEffectiveBatchSize()));
+    const availableSlots = Math.max(0, MAX_FILES_PER_BATCH - Math.max(0, Math.round(existingAttachmentCount)));
+    const sourceComposerCounts = options.composerAttachmentNameCounts instanceof Map
+      ? options.composerAttachmentNameCounts
+      : (typeof getComposerAttachmentNameCounts === 'function' ? getComposerAttachmentNameCounts() : new Map());
+    const composerNameCounts = new Map();
+
+    sourceComposerCounts.forEach((count, fileName) => {
+      const normalizedName = String(fileName || '').trim().toLowerCase();
+      const normalizedCount = Math.max(0, parseInt(count, 10) || 0);
+      if (!normalizedName || !normalizedCount) return;
+      composerNameCounts.set(normalizedName, normalizedCount);
+    });
+
+    const queueNameCounts = new Map();
+    queueItems.forEach(item => {
+      const fileName = getNormalizedQueueItemName(item);
+      if (!fileName) return;
+      queueNameCounts.set(fileName, (queueNameCounts.get(fileName) || 0) + 1);
+    });
+
+    const reusableCandidateIndices = [];
+    queueItems.forEach((item, index) => {
+      const fileName = getNormalizedQueueItemName(item);
+      const remainingComposerMatches = fileName ? (composerNameCounts.get(fileName) || 0) : 0;
+      const canReuseComposerAttachment = Boolean(
+        fileName &&
+        queueNameCounts.get(fileName) === 1 &&
+        remainingComposerMatches > 0
+      );
+      if (!canReuseComposerAttachment) return;
+      reusableCandidateIndices.push(index);
+      if (remainingComposerMatches <= 1) composerNameCounts.delete(fileName);
+      else composerNameCounts.set(fileName, remainingComposerMatches - 1);
+    });
+
+    const batchCapacity = Math.min(
+      queueItems.length,
+      batchSize,
+      reusableCandidateIndices.length + availableSlots
+    );
+    const selectedReusableIndices = new Set(reusableCandidateIndices.slice(0, batchCapacity));
+    const preloadedCount = selectedReusableIndices.size;
+    const injectableCapacity = Math.max(0, batchCapacity - preloadedCount);
+    const batchItems = [];
+    const injectItems = [];
+    const preloadedItems = [];
+
+    queueItems.forEach((item, index) => {
+      if (batchItems.length >= batchCapacity) return;
+      if (selectedReusableIndices.has(index)) {
+        batchItems.push(item);
+        preloadedItems.push(item);
+        return;
+      }
+      if (injectItems.length >= injectableCapacity) return;
+      batchItems.push(item);
+      injectItems.push(item);
+    });
+
+    return {
+      batchItems,
+      injectItems,
+      preloadedItems,
+      availableSlots
+    };
+  }
+
   function buildRetryableFailureContext(options = {}) {
     const failedNames = Array.isArray(options.failedNames)
       ? Array.from(new Set(options.failedNames.filter(Boolean)))
@@ -265,6 +450,53 @@
     return startNextBatch(mode).catch(error => {
       console.warn('[DFS Uploader] startNextBatch() 出现未处理异常。', error);
     });
+  }
+
+  function hasSessionSendActivity() {
+    const currentLogEntry = getSessionLogEntry();
+    return state.phase === 'sending' || state.completedBatches > 0 || Boolean(currentLogEntry?.sentAt);
+  }
+
+  function syncSessionToConversationRoute() {
+    const routeKey = getCurrentConversationRouteKey();
+    const landingPageVisible = typeof isFreshConversationLandingPage === 'function'
+      ? isFreshConversationLandingPage()
+      : false;
+    if (!routeKey) return false;
+
+    if (!hasPendingWork()) {
+      state.sessionRouteOriginKey = routeKey;
+      state.sessionEstablishedRouteKey = landingPageVisible ? '' : routeKey;
+      return false;
+    }
+
+    if (!state.sessionRouteOriginKey) {
+      state.sessionRouteOriginKey = routeKey;
+      state.sessionEstablishedRouteKey = landingPageVisible ? '' : routeKey;
+      return false;
+    }
+
+    if (!state.sessionEstablishedRouteKey) {
+      if (!landingPageVisible && (routeKey !== state.sessionRouteOriginKey || hasSessionSendActivity())) {
+        state.sessionEstablishedRouteKey = routeKey;
+        return false;
+      }
+      return false;
+    }
+
+    if (routeKey === state.sessionEstablishedRouteKey && !landingPageVisible) {
+      return false;
+    }
+
+    const hadPendingWork = hasPendingWork();
+    resetSessionState();
+    state.sessionRouteOriginKey = routeKey;
+    state.sessionEstablishedRouteKey = '';
+    if (hadPendingWork) {
+      updateAll();
+      hideDrawer();
+    }
+    return true;
   }
 
   function getQueueWithoutCurrentBatchItems(batchItems = state.currentBatch) {
@@ -711,6 +943,12 @@
     state.currentBatchLogId = '';
     state.sessionLogSequence = 0;
     state.sessionLog = [];
+    state.folderReviewPending = false;
+    state.reviewMode = 'preview';
+    state.reviewQuery = '';
+    state.removedDuringReviewCount = 0;
+    state.sessionRouteOriginKey = '';
+    state.sessionEstablishedRouteKey = '';
     clearFailureContext();
     resetAdaptiveBatching();
     resetBatchAttachmentStatus();
@@ -1212,8 +1450,18 @@
 
   async function startNextBatch(mode = state.uploadMode) {
     if (isBusyPhase()) return;
+    const startedFromFolderReview = state.phase === 'reviewing' || state.folderReviewPending;
+    const reviewTransitionToken = state.runToken;
+    if (state.folderReviewPending) completeFolderReview();
     clearSuccessTimer();
     clearAdvanceTimer();
+
+    if (startedFromFolderReview) {
+      updateAll();
+      showDrawer('queue');
+      await sleep(180);
+      if (reviewTransitionToken !== state.runToken || state.isPaused) return;
+    }
 
     if (hasCurrentBatch()) {
       const attachmentsStillVisible = getComposerAttachmentCount() > state.composerBaselineAttachments;
@@ -1268,22 +1516,26 @@
     state.lastSettledBatchSize = 0;
     state.nextBatchReadyAt = 0;
     const composerAttachmentCount = getComposerAttachmentCount();
-    const nextBatchSize = Math.min(state.queue.length, getInjectableBatchSize(composerAttachmentCount));
-    if (nextBatchSize <= 0) {
+    const batchPlan = buildCurrentBatchSelectionPlan({
+      existingAttachmentCount: composerAttachmentCount
+    });
+    if (!batchPlan.batchItems.length) {
       state.phase = state.queue.length ? 'queued' : 'idle';
       state.errorMessage = `当前输入框已有 ${composerAttachmentCount} 个附件，已达到 DeepSeek 的 ${MAX_FILES_PER_BATCH} 个附件上限。请先发送或清空输入框中的现有附件，再继续本轮上传。`;
       updateAll();
       showDrawer('queue');
       return;
     }
-    state.currentBatch = state.queue.slice(0, nextBatchSize);
+    const preloadedCount = batchPlan.preloadedItems.length;
+    const injectItems = batchPlan.injectItems.slice();
+    state.currentBatch = batchPlan.batchItems.slice();
     state.phase = 'injecting';
     state.errorMessage = '';
     clearFailureContext();
     state.composerBaselineAttachments = composerAttachmentCount;
     state.currentBatchExpectedAttachments = state.currentBatch.length;
-    state.currentBatchDetectedAttachments = 0;
-    state.currentBatchAttachmentsConfirmed = false;
+    state.currentBatchDetectedAttachments = preloadedCount;
+    state.currentBatchAttachmentsConfirmed = injectItems.length === 0;
     ensureCurrentBatchLog({
       status: 'injecting',
       batchItems: state.currentBatch
@@ -1291,44 +1543,50 @@
     setCurrentBatchLogStatus('injecting', {
       batchItems: state.currentBatch,
       clearError: true,
-      notes: '开始注入当前批次附件。'
+      notes: injectItems.length
+        ? (preloadedCount
+          ? `开始注入当前批次附件；其中 ${preloadedCount} 个文件已存在于输入框中。`
+          : '开始注入当前批次附件。')
+        : '当前批次文件已存在于输入框中，等待发送。'
     });
     updateAll();
     showDrawer('queue');
 
     try {
-      await injectFiles(state.currentBatch.map(item => item.file), runToken);
-      if (runToken !== state.runToken) return;
+      if (injectItems.length) {
+        await injectFiles(injectItems.map(item => item.file), runToken);
+        if (runToken !== state.runToken) return;
 
-      const attachmentResult = await waitForAttachmentsWithBackoff(runToken, state.currentBatch.length);
-      if (runToken !== state.runToken) return;
-      state.currentBatchDetectedAttachments = attachmentResult.increase;
-      state.currentBatchAttachmentsConfirmed = attachmentResult.confirmed;
+        const attachmentResult = await waitForAttachmentsWithBackoff(runToken, injectItems.length, injectItems);
+        if (runToken !== state.runToken) return;
+        state.currentBatchDetectedAttachments = preloadedCount + attachmentResult.increase;
+        state.currentBatchAttachmentsConfirmed = attachmentResult.confirmed;
 
-      if (!attachmentResult.confirmed) {
-        if (attachmentResult.blockedByError) {
-          const adaptiveAdjustment = registerAdaptiveFailure({ serverBusy: attachmentResult.serverBusy });
-          const failureContext = buildRetryableFailureContext({
-            failedNames: attachmentResult.failedNames,
-            errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error'
-          });
+        if (!attachmentResult.confirmed) {
+          if (attachmentResult.blockedByError) {
+            const adaptiveAdjustment = registerAdaptiveFailure({ serverBusy: attachmentResult.serverBusy });
+            const failureContext = buildRetryableFailureContext({
+              failedNames: attachmentResult.failedNames,
+              errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error'
+            });
+            enterErrorState(
+              attachmentResult.serverBusy
+                ? `检测到当前批次命中了“服务器繁忙”，并已按更长退避重试 3 轮后仍未恢复。${getAdaptiveBatchingMessage(adaptiveAdjustment)}为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。`
+                : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。',
+              {
+                errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error',
+                failureContext
+              }
+            );
+            return;
+          }
+          registerAdaptiveFailure();
           enterErrorState(
-            attachmentResult.serverBusy
-              ? `检测到当前批次命中了“服务器繁忙”，并已按更长退避重试 3 轮后仍未恢复。${getAdaptiveBatchingMessage(adaptiveAdjustment)}为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。`
-              : '检测到当前批次存在上传失败的附件（例如“重试上传”或网络错误）。为避免继续误发，已暂停自动发送。请先清空失败附件，稍等几秒后再点击“重试本批”。',
-            {
-              errorType: attachmentResult.serverBusy ? 'server_busy' : 'attachment_error',
-              failureContext
-            }
+            `仅确认到 ${state.currentBatchDetectedAttachments}/${state.currentBatch.length} 个附件。为避免静默丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`,
+            { errorType: 'attachment_confirm_incomplete' }
           );
           return;
         }
-        registerAdaptiveFailure();
-        enterErrorState(
-          `仅确认到 ${attachmentResult.increase}/${state.currentBatch.length} 个附件。为避免静默丢文件，已停止自动发送。请检查输入框中的附件；如有残留请先清空，再点击“重试本批”。`,
-          { errorType: 'attachment_confirm_incomplete' }
-        );
-        return;
       }
 
       state.errorMessage = '';
@@ -1447,6 +1705,14 @@
     state.uploadSource = source;
     state.queue = queue;
     state.skipped = skipped;
+    state.sessionRouteOriginKey = getCurrentConversationRouteKey();
+    state.sessionEstablishedRouteKey = typeof isFreshConversationLandingPage === 'function' && !isFreshConversationLandingPage()
+      ? state.sessionRouteOriginKey
+      : '';
+    state.folderReviewPending = source === 'folder' && queue.length > 0;
+    state.reviewMode = 'preview';
+    state.reviewQuery = '';
+    state.removedDuringReviewCount = 0;
     state.phase = queue.length ? 'queued' : 'idle';
     rememberHistory(queue.length, skipped.length);
     saveState();
@@ -1454,6 +1720,12 @@
     showDrawer('queue');
 
     if (queue.length) {
+      if (source === 'folder' && state.folderReviewPending) {
+        beginFolderReview();
+        updateAll();
+        showDrawer('queue');
+        return;
+      }
       startNextBatchSafely(state.uploadMode);
     }
   }
@@ -1617,6 +1889,11 @@
     getBatchCooldownMs,
     getRemainingBatchCooldownMs,
     describeBatchCooldown,
+    isFolderReviewPhase,
+    getRemainingFolderReviewMs,
+    pauseFolderReviewAutoStart,
+    completeFolderReview,
+    beginFolderReview,
     getAttachmentRetryDelayMs,
     getSessionLogEntry,
     ensureCurrentBatchLog,
@@ -1632,6 +1909,9 @@
     registerAdaptiveFailure,
     registerSuccessfulBatch,
     getAdaptiveBatchingMessage,
+    getCurrentConversationRouteKey,
+    syncSessionToConversationRoute,
+    buildCurrentBatchSelectionPlan,
     buildBatchMessage,
     mergeComposerMessage,
     fillComposerMessage,
@@ -1668,6 +1948,11 @@
     getBatchCooldownMs,
     getRemainingBatchCooldownMs,
     describeBatchCooldown,
+    isFolderReviewPhase,
+    getRemainingFolderReviewMs,
+    pauseFolderReviewAutoStart,
+    completeFolderReview,
+    beginFolderReview,
     getAttachmentRetryDelayMs,
     getSessionLogEntry,
     ensureCurrentBatchLog,
@@ -1682,6 +1967,9 @@
     resetAdaptiveBatching,
     registerAdaptiveFailure,
     registerSuccessfulBatch,
-    getAdaptiveBatchingMessage
+    getAdaptiveBatchingMessage,
+    buildCurrentBatchSelectionPlan,
+    getCurrentConversationRouteKey,
+    syncSessionToConversationRoute
   };
 })();

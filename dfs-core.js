@@ -19,6 +19,7 @@
   const MIN_BATCH_INTERVAL_SECONDS = 3;
   const MAX_BATCH_INTERVAL_SECONDS = 30;
   const DEFAULT_BATCH_INTERVAL_SECONDS = 5;
+  const FOLDER_REVIEW_AUTOSTART_MS = 5000;
 
   function escapeKeywordRegExp(text) {
     return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -132,6 +133,15 @@
     advanceTimerId: null,
     cooldownTickerId: null,
     successTimerId: null,
+    reviewTimerId: null,
+    reviewTickerId: null,
+    reviewAutoStartAt: 0,
+    folderReviewPending: false,
+    reviewMode: 'preview',
+    reviewQuery: '',
+    removedDuringReviewCount: 0,
+    sessionRouteOriginKey: '',
+    sessionEstablishedRouteKey: '',
     history: [],
     config: {
       batchSize: 50,
@@ -370,10 +380,23 @@
     }
   }
 
+  function clearReviewTimer() {
+    if (state.reviewTimerId) {
+      clearTimeout(state.reviewTimerId);
+      state.reviewTimerId = null;
+    }
+    if (state.reviewTickerId) {
+      clearInterval(state.reviewTickerId);
+      state.reviewTickerId = null;
+    }
+    state.reviewAutoStartAt = 0;
+  }
+
   function clearAllTimers() {
     clearSettlementTimer();
     clearAdvanceTimer();
     clearSuccessTimer();
+    clearReviewTimer();
   }
 
   function resetBatchAttachmentStatus() {
@@ -480,10 +503,11 @@
     const queue = [];
     const skipped = [];
     for (const file of files) {
+      const relativePath = String(file.webkitRelativePath || file.name || '').trim() || file.name;
       if (isAllowedFile(file)) {
-        queue.push({ name: file.name, size: file.size, type: file.type, file });
+        queue.push({ name: file.name, path: relativePath, size: file.size, type: file.type, file });
       } else {
-        skipped.push({ name: file.name, size: file.size, type: file.type, file, reason: getRejectReason(file) });
+        skipped.push({ name: file.name, path: relativePath, size: file.size, type: file.type, file, reason: getRejectReason(file) });
       }
     }
     return { queue, skipped };
@@ -514,6 +538,8 @@
         return { text: '发送中', chip: 'teal' };
       case 'cooldown':
         return { text: '冷却中', chip: 'sand' };
+      case 'reviewing':
+        return { text: '检查中', chip: 'slate' };
       case 'paused':
         return { text: '已暂停', chip: 'gray' };
       case 'error':
@@ -587,6 +613,7 @@
     AUTO_SEND_READY_TIMEOUT_MS,
     AUTO_SEND_POLL_MS,
     AUTO_CONTEXT_MARKER,
+    FOLDER_REVIEW_AUTOSTART_MS,
     KEYWORD_GROUPS,
     SEND_KEYWORD_RE,
     STOP_KEYWORD_RE,

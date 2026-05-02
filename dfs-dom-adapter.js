@@ -115,6 +115,8 @@
     VIEWPORT_MARGIN: 12
   };
 
+  let conversationContextSyncScheduled = false;
+
   function scoreComposerRootFeatures(features) {
     let score = 0;
     if (features.isForm) score += COMPOSER_ROOT_SCORE.FORM;
@@ -773,6 +775,7 @@
       scheduleDomCacheInvalidation();
       const relevant = mutations.some(mutation => !ui.wrapper?.contains(mutation.target));
       if (!relevant) return;
+      scheduleConversationContextSync();
       schedulePlacementSync();
     });
 
@@ -870,6 +873,25 @@
     return getAttachmentCount(findComposerRoot());
   }
 
+  function getComposerAttachmentNameCounts(root = findComposerRoot()) {
+    if (arguments.length === 0) {
+      return getCachedDomValue('composer-attachment-name-counts', () => getComposerAttachmentNameCounts(findComposerRoot()));
+    }
+
+    const counts = new Map();
+    if (!(root instanceof HTMLElement)) return counts;
+
+    const attachmentElements = collectAttachmentElements(root);
+    attachmentElements.forEach(element => {
+      const names = Array.from(extractDetectedFileNames([getElementText(element)]));
+      if (!names.length) return;
+      const fileName = names[0];
+      counts.set(fileName, (counts.get(fileName) || 0) + 1);
+    });
+
+    return counts;
+  }
+
   function getUploadInputFileCount() {
     const input = findUploadInput();
     return input?.files?.length || 0;
@@ -957,6 +979,26 @@
     });
   }
 
+  function isFreshConversationLandingPage() {
+    return getCachedDomValue('fresh-conversation-landing', () => {
+      const headingText = Array.from(document.querySelectorAll('h1, h2, [role="heading"]'))
+        .filter(element => element instanceof HTMLElement && isElementVisible(element))
+        .map(getElementText)
+        .join(' ');
+      const normalizedHeading = normalizeSearchText(headingText);
+      return normalizedHeading.includes('开始对话') || normalizedHeading.includes('start conversation');
+    });
+  }
+
+  function scheduleConversationContextSync() {
+    if (conversationContextSyncScheduled) return;
+    conversationContextSyncScheduled = true;
+    queueMicrotask(() => {
+      conversationContextSyncScheduled = false;
+      shared.syncSessionToConversationRoute?.();
+    });
+  }
+
   shared.syncUIPlacement = syncUIPlacement;
   shared.getComposerAttachmentCount = getComposerAttachmentCount;
 
@@ -999,10 +1041,12 @@
     observeComposerSignals,
     getAttachmentCount,
     getComposerAttachmentCount,
+    getComposerAttachmentNameCounts,
     getUploadInputFileCount,
     inspectBatchAttachmentState,
     countMatchedBatchFileNames,
-    hasAttachmentErrorIndicators
+    hasAttachmentErrorIndicators,
+    isFreshConversationLandingPage
   });
 
   shared.__dfsHeuristics = {
